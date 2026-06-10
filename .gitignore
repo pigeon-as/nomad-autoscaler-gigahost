@@ -8,6 +8,9 @@
 *.so
 *.dylib
 
+# Build output (Makefile BUILD_DIR)
+/build/
+
 # Test binary, built with `go test -c`
 *.test
 
