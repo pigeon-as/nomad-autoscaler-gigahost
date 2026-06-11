@@ -213,13 +213,14 @@ func writeScaleOutPolicy(dir string) error {
 	return os.WriteFile(filepath.Join(dir, "e2e-out.hcl"), []byte(policy), 0o644)
 }
 
-// min=0 over the dev agent's node (dc1): the autoscaler drains it and cancels
-// the mapped server.
+// Scale from 2 nodes to 1: the autoscaler forces min=1 on nomad-apm cluster
+// policies (scaling to 0 is unsupported). The class must be explicit —
+// cluster queries are canonicalized with the target's node_class only.
 func writeScaleInPolicy(dir string) error {
 	policy := `scaling "e2e-in" {
   enabled = true
-  min     = 0
-  max     = 1
+  min     = 1
+  max     = 2
 
   policy {
     evaluation_interval = "10s"
@@ -236,7 +237,7 @@ func writeScaleInPolicy(dir string) error {
     }
 
     target "gigahost" {
-      datacenter          = "dc1"
+      node_class          = "gigahost-e2e-node"
       node_drain_deadline = "2m"
     }
   }
@@ -403,13 +404,27 @@ func waitNodeReady(t *testing.T, nc *nomadapi.Client, nodeID string) {
 
 // The status view can omit in-flight orders; the server list, matched by
 // order id, is the durable completion source (mirrors the plugin).
-func waitServerReady(t *testing.T, c *gigahost.Client, orderIDs []int64) string {
+func waitServersReady(t *testing.T, c *gigahost.Client, orderIDs []int64, want int) []string {
 	t.Helper()
+	orderSet := make(map[int64]bool, len(orderIDs))
+	for _, id := range orderIDs {
+		orderSet[id] = true
+	}
+	ready := make(map[string]bool)
+
+	collect := func() []string {
+		ids := make([]string, 0, len(ready))
+		for id := range ready {
+			ids = append(ids, id)
+		}
+		return ids
+	}
+
 	deadline := time.After(10 * time.Minute)
 	for poll := 0; ; poll++ {
 		select {
 		case <-deadline:
-			t.Fatalf("timed out waiting for deploy of orders %v to become ready", orderIDs)
+			t.Fatalf("timed out waiting for deploy of orders %v (ready so far: %v)", orderIDs, collect())
 		default:
 		}
 
@@ -417,10 +432,13 @@ func waitServerReady(t *testing.T, c *gigahost.Client, orderIDs []int64) string 
 		if err == nil {
 			seen := false
 			for _, s := range status.Servers {
+				if !orderSet[s.Order()] {
+					continue
+				}
 				seen = true
 				switch s.Status {
 				case "ready":
-					return strconv.FormatInt(s.Server(), 10)
+					ready[strconv.FormatInt(s.Server(), 10)] = true
 				case "error", "failed", "cancelled", "suspended":
 					t.Fatalf("deploy failed with status %q", s.Status)
 				}
@@ -429,19 +447,20 @@ func waitServerReady(t *testing.T, c *gigahost.Client, orderIDs []int64) string 
 				if servers, lerr := c.ListServers(context.Background()); lerr == nil {
 					for _, s := range servers {
 						id, perr := strconv.ParseInt(s.Order.OrderID, 10, 64)
-						if perr != nil || s.Cancelled() {
+						if perr != nil || !orderSet[id] || s.Cancelled() {
 							continue
 						}
-						for _, want := range orderIDs {
-							if id == want && !s.Installing() && s.Running() {
-								return s.SrvID
-							}
+						if !s.Installing() && s.Running() {
+							ready[s.SrvID] = true
 						}
 					}
 				}
 			}
+			if len(ready) >= want {
+				return collect()
+			}
 			if poll%12 == 11 {
-				t.Logf("still waiting for deploy of orders %v", orderIDs)
+				t.Logf("still waiting for deploy of orders %v (ready so far: %v)", orderIDs, collect())
 			}
 		}
 		time.Sleep(5 * time.Second)
@@ -455,9 +474,10 @@ func TestPluginHealthy(t *testing.T) {
 	must.Eq(t, 200, resp.StatusCode)
 }
 
-// A real server is deployed and mapped onto the dev node via dynamic node
-// meta; a min=0 policy then drives drain -> meta lookup -> CancelServer ->
-// ensureServersGone, all live.
+// Two real servers are deployed (one batch order) and mapped onto the two
+// class nodes via dynamic node meta; a min=1 policy then drives drain -> meta
+// lookup -> CancelServer -> ensureServersGone for exactly one of them, live.
+// Requires both make dev and make dev2.
 func TestScaleInLifecycle(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping: -short")
@@ -469,37 +489,48 @@ func TestScaleInLifecycle(t *testing.T) {
 	client := newGigahostClient(t)
 	ctx := context.Background()
 
-	result, err := client.Deploy(ctx, resolveDeployInput(t, client))
-	must.NoError(t, err)
-	must.True(t, len(result.OrderIDs) > 0)
-	srvID := waitServerReady(t, client, result.OrderIDs)
-	t.Logf("deployed server %s for scale-in", srvID)
-	t.Cleanup(func() { cancelServer(client, srvID) })
-
-	// Dynamic node meta — the same key workers set during bootstrap.
 	nomadClient, err := nomadapi.NewClient(nomadapi.DefaultConfig())
 	must.NoError(t, err)
-	nodes, _, err := nomadClient.Nodes().List(nil)
-	must.NoError(t, err)
-	must.True(t, len(nodes) > 0)
-	nodeID := nodes[0].ID
+	nodeIDs := waitClassNodes(t, nomadClient, 2)
 
-	_, err = nomadClient.Nodes().Meta().Apply(&nomadapi.NodeMetaApplyRequest{
-		NodeID: nodeID,
-		Meta:   map[string]*string{nodeMetaKey: &srvID},
-	}, nil)
+	in := resolveDeployInput(t, client)
+	in.Quantity = 2
+	result, err := client.Deploy(ctx, in)
 	must.NoError(t, err)
+	must.True(t, len(result.OrderIDs) > 0)
+	srvIDs := waitServersReady(t, client, result.OrderIDs, 2)
+	must.Eq(t, 2, len(srvIDs))
+	t.Logf("deployed servers %v for scale-in", srvIDs)
 	t.Cleanup(func() {
-		_, _ = nomadClient.Nodes().Meta().Apply(&nomadapi.NodeMetaApplyRequest{
-			NodeID: nodeID,
-			Meta:   map[string]*string{nodeMetaKey: nil},
-		}, nil)
-		_, _ = nomadClient.Nodes().ToggleEligibility(nodeID, true, nil)
+		for _, id := range srvIDs {
+			cancelServer(client, id)
+		}
 	})
-	t.Logf("mapped Nomad node %s to server %s", nodeID, srvID)
 
-	waitNoInstalling(t, client, srvID)
-	waitNodeReady(t, nomadClient, nodeID)
+	// Dynamic node meta — the same key workers set during bootstrap.
+	for i, nodeID := range nodeIDs {
+		srvID := srvIDs[i]
+		_, err = nomadClient.Nodes().Meta().Apply(&nomadapi.NodeMetaApplyRequest{
+			NodeID: nodeID,
+			Meta:   map[string]*string{nodeMetaKey: &srvID},
+		}, nil)
+		must.NoError(t, err)
+		t.Logf("mapped Nomad node %s to server %s", nodeID, srvID)
+	}
+	t.Cleanup(func() {
+		for _, nodeID := range nodeIDs {
+			_, _ = nomadClient.Nodes().Meta().Apply(&nomadapi.NodeMetaApplyRequest{
+				NodeID: nodeID,
+				Meta:   map[string]*string{nodeMetaKey: nil},
+			}, nil)
+			_, _ = nomadClient.Nodes().ToggleEligibility(nodeID, true, nil)
+		}
+	})
+
+	waitNoInstalling(t, client, srvIDs...)
+	for _, nodeID := range nodeIDs {
+		waitNodeReady(t, nomadClient, nodeID)
+	}
 
 	must.NoError(t, writeScaleInPolicy(policyDir))
 	reloadPolicies(t)
@@ -508,39 +539,81 @@ func TestScaleInLifecycle(t *testing.T) {
 		reloadPolicies(t)
 	})
 
-	t.Log("waiting for autoscaler to drain node and cancel server (up to 10 min)...")
+	t.Log("waiting for autoscaler to drain one node and cancel its server (up to 10 min)...")
 	deadline := time.After(10 * time.Minute)
 	for poll := 0; ; poll++ {
 		select {
 		case <-deadline:
-			if node, _, err := nomadClient.Nodes().Info(nodeID, nil); err == nil {
-				t.Logf("node state at timeout: status=%s eligibility=%s drain=%v", node.Status, node.SchedulingEligibility, node.Drain)
-			}
+			logNodeStates(t, nomadClient, nodeIDs)
 			t.Fatal("timed out waiting for scale-in")
 		default:
 		}
 
 		servers, err := client.ListServers(ctx)
 		if err == nil {
-			gone := true
-			for _, s := range servers {
-				if s.SrvID == srvID && !s.Cancelled() {
-					gone = false
-					break
+			cancelled := 0
+			for _, srvID := range srvIDs {
+				gone := true
+				for _, s := range servers {
+					if s.SrvID == srvID && !s.Cancelled() {
+						gone = false
+						break
+					}
+				}
+				if gone {
+					cancelled++
 				}
 			}
-			if gone {
-				t.Logf("server %s cancelled by autoscaler", srvID)
+			switch cancelled {
+			case 0:
+			case 1:
+				t.Logf("exactly one of %v cancelled by autoscaler", srvIDs)
 				return
+			default:
+				t.Fatalf("expected one of %v cancelled, got %d", srvIDs, cancelled)
 			}
 		}
 
 		if poll%4 == 3 {
-			if node, _, err := nomadClient.Nodes().Info(nodeID, nil); err == nil {
-				t.Logf("still waiting: node status=%s eligibility=%s drain=%v", node.Status, node.SchedulingEligibility, node.Drain)
-			}
+			logNodeStates(t, nomadClient, nodeIDs)
 		}
 		time.Sleep(15 * time.Second)
+	}
+}
+
+// waitClassNodes waits for n ready, eligible nodes of the e2e node class —
+// the dev agent (make dev) plus the second client (make dev2).
+func waitClassNodes(t *testing.T, nc *nomadapi.Client, n int) []string {
+	t.Helper()
+	deadline := time.After(2 * time.Minute)
+	for {
+		var ids []string
+		nodes, _, err := nc.Nodes().List(nil)
+		if err == nil {
+			for _, node := range nodes {
+				if node.NodeClass == "gigahost-e2e-node" && node.Status == "ready" &&
+					node.SchedulingEligibility == "eligible" {
+					ids = append(ids, node.ID)
+				}
+			}
+			if len(ids) >= n {
+				return ids[:n]
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("expected %d ready nodes of class gigahost-e2e-node, found %d — is make dev2 running?", n, len(ids))
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+func logNodeStates(t *testing.T, nc *nomadapi.Client, nodeIDs []string) {
+	t.Helper()
+	for _, nodeID := range nodeIDs {
+		if node, _, err := nc.Nodes().Info(nodeID, nil); err == nil {
+			t.Logf("node %s: status=%s eligibility=%s drain=%v", nodeID, node.Status, node.SchedulingEligibility, node.Drain)
+		}
 	}
 }
 

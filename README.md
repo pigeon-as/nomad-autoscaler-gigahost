@@ -58,7 +58,7 @@ scaling "gigahost_workers" {
 
     check "cpu_allocated" {
       source = "nomad-apm"
-      query  = "node_percentage-allocated_cpu"
+      query  = "percentage-allocated_cpu"
       strategy "target-value" {
         target = 80
       }
@@ -66,14 +66,14 @@ scaling "gigahost_workers" {
 
     check "mem_allocated" {
       source = "nomad-apm"
-      query  = "node_percentage-allocated_memory"
+      query  = "percentage-allocated_memory"
       strategy "target-value" {
         target = 80
       }
     }
 
     target "gigahost" {
-      node_pool              = "workers"
+      node_class             = "workers"
       node_drain_deadline    = "15m"
       node_purge             = "true"
       node_selector_strategy = "least_busy"
@@ -90,6 +90,12 @@ scaling "gigahost_workers" {
 
 Both checks track **allocated** (reserved) capacity, not utilization; with two
 the autoscaler scales out on whichever resource — CPU or memory — is tightest.
+
+Note for nomad-apm cluster queries: the autoscaler expands the short query
+using the target's **`node_class` only**, so workers must carry a node class
+and the policy must filter on it (a `datacenter`/`node_pool`-only filter
+leaves the query without a usable pool). The autoscaler also forces
+`min = 1` — a Gigahost pool cannot be scaled to zero through the Nomad APM.
 
 | Key | Default | Description |
 |-----|---------|-------------|
