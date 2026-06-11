@@ -64,12 +64,22 @@ The test starts a `nomad-autoscaler` agent as a subprocess with:
 - Our built plugin binary in a temp plugin dir (the binary, `driver`, and the
   plugin's reported name must all match — here `gigahost`)
 - A generated agent config with the Gigahost token from env
-- A scaling policy (min=1) if the lifecycle env vars are set
+
+Each lifecycle test writes its own policy file and removes it afterwards, so
+the two never run concurrently. The autoscaler's file policy source only
+re-scans the directory on reload, so every policy change is followed by a
+SIGHUP to the agent.
 
 **TestPluginHealthy** checks the autoscaler health endpoint (validating the full
 go-plugin RPC path: binary discovery → launch → SetConfig).
 
 **TestScaleLifecycle** waits for the autoscaler to evaluate the min=1 policy and
-deploy a Gigahost server, then cleans up via the Gigahost API. Because Gigahost
-has no server-side tag filter, the test detects the new server by diffing the
-account's server list.
+deploy a Gigahost server, then cleans up via the Gigahost API. Gigahost has no
+server-side tag filter and does not surface the requested hostname in
+`srv_hostname` (verified live), so detection and cleanup diff the whole account
+server list — **a dedicated test account is required**: any server created on
+the account during the test window will be detected and cancelled.
+
+Note: with the plugin's post-scale-out wait for Nomad nodes, the deployed
+server never joins the dev Nomad here, so the autoscaler eventually logs a
+scale-out failure after the test has already detected the server — expected.

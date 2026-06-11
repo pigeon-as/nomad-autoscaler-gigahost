@@ -43,6 +43,12 @@ func (t *TargetPlugin) scaleIn(ctx context.Context, num int64, config map[string
 	}
 
 	if len(successes) > 0 {
+		// Non-fatal by design, but this is the billing alarm for a cancelled
+		// server that kept running.
+		if err := t.ensureServersGone(ctx, successes); err != nil {
+			t.logger.Error("failed to confirm cancelled servers terminated", "error", err)
+		}
+
 		if err := t.clusterUtils.RunPostScaleInTasks(ctx, config, successes); err != nil {
 			t.logger.Error("failed to perform post-scale Nomad scale in tasks", "error", err)
 		}
@@ -60,9 +66,10 @@ func (t *TargetPlugin) scaleIn(ctx context.Context, num int64, config map[string
 	return nil
 }
 
-// Gigahost isn't a scale set — no resize API — so unlike aws-asg/gce-mig we
-// create (desired-current) servers individually; the policy cooldown must
-// prevent re-evaluation while they provision.
+// Gigahost isn't a scale set — no resize API — so scale-out is one batch
+// deploy of (desired-current) servers, then a wait for the new nodes to join
+// the Nomad pool so the count source reflects the new capacity before Scale
+// returns.
 func (t *TargetPlugin) scaleOut(ctx context.Context, desired, current int64, config map[string]string) error {
 	productName, err := requireString(config, configKeyProductName)
 	if err != nil {
@@ -91,7 +98,6 @@ func (t *TargetPlugin) scaleOut(ctx context.Context, desired, current int64, con
 		return fmt.Errorf("config param %s is not a valid boolean: %v", configKeyBackups, err)
 	}
 
-	// Resolve names to catalog ids once, before the create loop.
 	catalog, err := t.client.GetDeployCatalog(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to read Gigahost server catalog: %v", err)
@@ -104,6 +110,9 @@ func (t *TargetPlugin) scaleOut(ctx context.Context, desired, current int64, con
 	if err != nil {
 		return err
 	}
+	if !productOffersRegion(catalog, productID, regionID) {
+		return fmt.Errorf("product %q is not available in region %q", productName, region)
+	}
 
 	osCatalog, err := t.client.GetOSCatalog(ctx)
 	if err != nil {
@@ -114,29 +123,43 @@ func (t *TargetPlugin) scaleOut(ctx context.Context, desired, current int64, con
 		return err
 	}
 
+	toCreate := desired - current
+
+	// The deploy API applies one hostname per server; batches let Gigahost
+	// assign unique hostnames.
+	hostname := getConfigValue(config, configKeyHostname, "")
+	if hostname != "" && toCreate > 1 {
+		t.logger.Warn("ignoring configured hostname for multi-server scale out",
+			"hostname", hostname, "create_count", toCreate)
+		hostname = ""
+	}
+
 	in := gigahost.DeployInput{
 		ProductID: productID,
 		PriceID:   priceID,
 		RegionID:  regionID,
 		OSID:      &osID,
-		Hostname:  getConfigValue(config, configKeyHostname, ""),
+		Hostname:  hostname,
 		SSHKeys:   sshKeys,
 		Backups:   backups,
 	}
 
-	toCreate := desired - current
 	log := t.logger.With("action", "scale_out",
 		"desired_count", desired, "current_count", current, "create_count", toCreate)
 
-	for i := int64(0); i < toCreate; i++ {
-		log.Info("deploying Gigahost server", "count", fmt.Sprintf("%d/%d", i+1, toCreate))
-		srvID, err := t.createServer(ctx, in)
-		if err != nil {
-			return fmt.Errorf("failed to create Gigahost server: %v", err)
-		}
-		log.Info("server deployed and ready", "server_id", srvID)
+	log.Info("deploying Gigahost servers")
+	srvIDs, err := t.createServers(ctx, in, toCreate)
+	if err != nil {
+		return fmt.Errorf("failed to create Gigahost servers: %v", err)
+	}
+	log.Info("servers deployed and ready", "server_ids", srvIDs)
+
+	// A server that deploys but never joins Nomad fails here (srv_id logged
+	// above) and is invisible to scale-in — operator attention required.
+	if err := t.ensurePoolNodesCount(ctx, config, desired); err != nil {
+		return fmt.Errorf("failed to confirm scale out: waiting for Nomad pool to reach %d nodes: %v", desired, err)
 	}
 
-	log.Info("successfully performed scaling out")
+	log.Info("successfully performed and verified scaling out")
 	return nil
 }

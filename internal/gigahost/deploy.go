@@ -15,6 +15,7 @@ type DeployInput struct {
 	ProductID int64
 	PriceID   int64
 	RegionID  int64
+	Quantity  int64
 	OSID      *int64
 	Hostname  string
 	SSHKeys   []int64
@@ -37,11 +38,15 @@ type DeployResult struct {
 }
 
 func (c *Client) Deploy(ctx context.Context, in DeployInput) (*DeployResult, error) {
+	quantity := in.Quantity
+	if quantity < 1 {
+		quantity = 1
+	}
 	body := deployRequest{
 		Pid:      in.ProductID,
 		PriceID:  in.PriceID,
 		RegionID: in.RegionID,
-		Quantity: 1,
+		Quantity: quantity,
 		OSID:     in.OSID,
 		SSHKeys:  in.SSHKeys,
 	}

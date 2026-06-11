@@ -2,7 +2,17 @@
 
 Nomad Autoscaler [target plugin](https://developer.hashicorp.com/nomad/tools/autoscaling/plugins/target) for horizontal cluster scaling via [Gigahost](https://gigahost.no) cloud servers (hourly-billed KVM VPS or dedicated bare metal).
 
-Deploys new servers when cluster resources are exhausted and cancels idle servers on scale-in. Servers are identified by the Nomad node attribute `unique.platform.gigahost.server_id` (the Gigahost `srv_id`), which workers set during bootstrap.
+Deploys new servers when cluster resources are exhausted and cancels idle servers on scale-in. Servers are identified by the Nomad node meta key `unique.platform.gigahost.server_id` (the Gigahost `srv_id`), which workers set during bootstrap — either in the client config:
+
+```hcl
+client {
+  meta {
+    "unique.platform.gigahost.server_id" = "17536"
+  }
+}
+```
+
+or at runtime with `nomad node meta apply 'unique.platform.gigahost.server_id=17536'`. (A node *attribute* of the same name is also honoured and takes precedence, but Nomad has no Gigahost fingerprinter, so meta is the practical path.)
 
 ## Agent Configuration
 
@@ -17,7 +27,8 @@ target "gigahost" {
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `gigahost_api_token` | required | Gigahost API token (created under **Account → API keys**) |
+| `gigahost_api_token` | required | Gigahost API token (created under **Account → API keys**). Falls back to the `GIGAHOST_API_TOKEN` environment variable |
+| `retry_attempts` | `60` | Number of 10s attempts to wait for new nodes to join the Nomad pool after a scale-out |
 
 ### Nomad ACL
 
@@ -87,7 +98,7 @@ the autoscaler scales out on whichever resource — CPU or memory — is tightes
 | `gigahost_os_distro` | `""` | OS distribution to install, e.g. `Ubuntu`. Required for scale-out |
 | `gigahost_os_version` | `""` | OS version, e.g. `24.04`. Required for scale-out |
 | `gigahost_ssh_keys` | `""` | Comma-separated SSH key ids to authorize on new servers |
-| `gigahost_hostname` | `""` | Hostname for new servers. **Leave empty when autoscaling** so Gigahost assigns unique hostnames |
+| `gigahost_hostname` | `""` | Hostname for new servers; applied only when a scale-out creates a single server. **Leave empty** so Gigahost assigns unique hostnames |
 | `gigahost_backups` | `false` | Enable daily backups (adds 25% to the price) |
 | `datacenter` | `""` | Nomad client datacenter filter |
 | `node_class` | `""` | Nomad client node class filter |
@@ -104,7 +115,13 @@ These are the same names the [terraform-provider-gigahost](https://github.com/pi
 
 ## Delivery Latency
 
-Gigahost servers take several minutes to deploy and install. Gigahost isn't a scale set — there's no provider-side desired-capacity (resize) API like AWS ASG / Azure VMSS / GCE MIG have — so the policy **`cooldown`** (above) is what prevents double-deploying while servers are still provisioning. `scaleOut` also blocks until each deployed server reports `ready` (30-minute timeout), so scaling actions are synchronous through provisioning.
+Gigahost servers take several minutes to deploy, install, and join the cluster. Gigahost isn't a scale set — there's no provider-side desired-capacity (resize) API like AWS ASG / Azure VMSS / GCE MIG have — so three mechanisms guard against double-deploying:
+
+- A scale-out is one batch deploy order; `Scale` blocks until every server reports ready (30-minute timeout) **and** the new nodes have joined the Nomad pool (`retry_attempts` × 10s), so the count reflects the new capacity before the next evaluation.
+- `Status` reports the target not-ready while a scaling action is executing and while any server on the account is still installing — the latter, unlike cooldown, survives autoscaler restarts. (The install check is account-wide: a manual deploy on the same account briefly pauses autoscaling.)
+- The policy **`cooldown`** (above) covers the rest.
+
+A server that deploys but never joins Nomad fails the scale-out with its `server_id` in the log, and is invisible to scale-in — alert on scale-out failures and cancel such servers manually.
 
 ## Build
 
