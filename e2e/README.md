@@ -26,10 +26,13 @@ connected to a Nomad dev cluster and the Gigahost API.
 
 ## Usage
 
-In one terminal, start the Nomad dev agent:
+In one terminal, start the Nomad dev agent; in a second, the extra client
+(the scale-in test needs two nodes — the autoscaler forces `min = 1` on
+nomad-apm cluster policies, so scale-in is exercised from 2 nodes to 1):
 
 ```sh
 make dev
+make dev2
 ```
 
 In another terminal, run the tests:
@@ -72,6 +75,11 @@ SIGHUP to the agent.
 
 **TestPluginHealthy** checks the autoscaler health endpoint (validating the full
 go-plugin RPC path: binary discovery → launch → SetConfig).
+
+**TestScaleInLifecycle** deploys two real servers as one batch order, maps
+them onto the two class nodes via dynamic node meta (the same key workers set
+during bootstrap), and a min=1 policy makes the autoscaler drain one node and
+cancel its server — the test fails if both are cancelled.
 
 **TestScaleLifecycle** waits for the autoscaler to evaluate the min=1 policy and
 deploy a Gigahost server, then cleans up via the Gigahost API. Gigahost has no
