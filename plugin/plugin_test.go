@@ -4,13 +4,21 @@
 package plugin
 
 import (
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
+	hclog "github.com/hashicorp/go-hclog"
+	"github.com/hashicorp/nomad-autoscaler/sdk/helper/scaleutils"
 	nomadapi "github.com/hashicorp/nomad/api"
 	"github.com/shoenig/test/must"
 
 	"github.com/pigeon-as/nomad-autoscaler-gigahost/internal/gigahost"
 )
+
+func testLogger() hclog.Logger { return hclog.NewNullLogger() }
 
 func TestCalculateDirection(t *testing.T) {
 	t.Parallel()
@@ -44,14 +52,37 @@ func TestGigahostNodeIDMap(t *testing.T) {
 		must.Eq(t, "42", id)
 	})
 
-	t.Run("attribute missing", func(t *testing.T) {
-		n := &nomadapi.Node{Attributes: map[string]string{}}
+	t.Run("meta fallback", func(t *testing.T) {
+		n := &nomadapi.Node{
+			Attributes: map[string]string{},
+			Meta:       map[string]string{nodeAttrGigahostServerID: "43"},
+		}
+		id, err := gigahostNodeIDMap(n)
+		must.NoError(t, err)
+		must.Eq(t, "43", id)
+	})
+
+	t.Run("attribute wins over meta", func(t *testing.T) {
+		n := &nomadapi.Node{
+			Attributes: map[string]string{nodeAttrGigahostServerID: "42"},
+			Meta:       map[string]string{nodeAttrGigahostServerID: "43"},
+		}
+		id, err := gigahostNodeIDMap(n)
+		must.NoError(t, err)
+		must.Eq(t, "42", id)
+	})
+
+	t.Run("missing everywhere", func(t *testing.T) {
+		n := &nomadapi.Node{Attributes: map[string]string{}, Meta: map[string]string{}}
 		_, err := gigahostNodeIDMap(n)
 		must.Error(t, err)
 	})
 
-	t.Run("attribute empty", func(t *testing.T) {
-		n := &nomadapi.Node{Attributes: map[string]string{nodeAttrGigahostServerID: ""}}
+	t.Run("empty values", func(t *testing.T) {
+		n := &nomadapi.Node{
+			Attributes: map[string]string{nodeAttrGigahostServerID: ""},
+			Meta:       map[string]string{nodeAttrGigahostServerID: ""},
+		}
 		_, err := gigahostNodeIDMap(n)
 		must.Error(t, err)
 	})
@@ -100,14 +131,123 @@ func TestParseInt64List(t *testing.T) {
 func testCatalog() *gigahost.DeployCatalog {
 	return &gigahost.DeployCatalog{
 		Tiers: []gigahost.DeployTier{{Products: []gigahost.DeployProduct{
-			{ProductID: 1, PriceID: 10, ProductName: "KVM Value VPS 4GB"},
-			{ProductID: 2, PriceID: 20, ProductName: "KVM Value VPS 8GB"},
+			{ProductID: 1, PriceID: 10, ProductName: "KVM Value VPS 4GB", RegionIDs: []int64{3}},
+			{ProductID: 2, PriceID: 20, ProductName: "KVM Value VPS 8GB", RegionIDs: []int64{4}},
 		}}},
 		Regions: []gigahost.DeployRegion{
 			{RegionID: "3", RegionName: "Sandefjord", RegionNameShort: "sdj", RegionActive: true},
 			{RegionID: "4", RegionName: "Oslo", RegionNameShort: "osl", RegionActive: false},
 		},
 	}
+}
+
+// Status view omits the order; the server list (matched by order id)
+// completes the wait.
+func TestWaitForServersListFallback(t *testing.T) {
+	orig := serverDeployPollInterval
+	serverDeployPollInterval = 5 * time.Millisecond
+	t.Cleanup(func() { serverDeployPollInterval = orig })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/deploy/status":
+			_, _ = w.Write([]byte(`{"meta":{},"data":{"servers":[]}}`))
+		case "/servers":
+			_, _ = w.Write([]byte(`{"meta":{},"data":[
+				{"srv_id":"77","srv_status":"1","srv_status_install":"0","order":{"order_id":"500","order_status":"active"}}
+			]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	client, err := gigahost.NewClient(&gigahost.Config{Address: srv.URL, Token: "t"})
+	must.NoError(t, err)
+
+	tp := &TargetPlugin{client: client, logger: testLogger(), retryAttempts: 1}
+	ids, err := tp.waitForServers(context.Background(), []int64{500}, 1)
+	must.NoError(t, err)
+	must.Eq(t, 1, len(ids))
+	must.Eq(t, "77", ids[0])
+}
+
+// A previously observed server that disappears from both views is gone.
+func TestWaitForServersGone(t *testing.T) {
+	orig := serverDeployPollInterval
+	serverDeployPollInterval = time.Millisecond
+	t.Cleanup(func() { serverDeployPollInterval = orig })
+
+	first := true
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/deploy/status":
+			if first {
+				first = false
+				_, _ = w.Write([]byte(`{"meta":{},"data":{"servers":[{"order_id":"500","srv_id":"77","status":"installing"}]}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"meta":{},"data":{"servers":[]}}`))
+		case "/servers":
+			_, _ = w.Write([]byte(`{"meta":{},"data":[]}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	client, err := gigahost.NewClient(&gigahost.Config{Address: srv.URL, Token: "t"})
+	must.NoError(t, err)
+
+	tp := &TargetPlugin{client: client, logger: testLogger(), retryAttempts: 1}
+	_, err = tp.waitForServers(context.Background(), []int64{500}, 1)
+	must.Error(t, err)
+	must.StrContains(t, err.Error(), "disappeared")
+	must.StrContains(t, err.Error(), "77")
+}
+
+func TestEnsureServersGone(t *testing.T) {
+	t.Parallel()
+
+	cases := map[string]string{
+		"servers absent":    `{"meta":{},"data":[]}`,
+		"servers cancelled": `{"meta":{},"data":[{"srv_id":"42","order":{"order_status":"cancelled"}}]}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(body))
+			}))
+			defer srv.Close()
+
+			client, err := gigahost.NewClient(&gigahost.Config{Address: srv.URL, Token: "t"})
+			must.NoError(t, err)
+
+			tp := &TargetPlugin{client: client, retryAttempts: 1}
+			err = tp.ensureServersGone(context.Background(), []scaleutils.NodeResourceID{
+				{NomadNodeID: "n1", RemoteResourceID: "42"},
+			})
+			must.NoError(t, err)
+		})
+	}
+}
+
+func TestProductOffersRegion(t *testing.T) {
+	t.Parallel()
+	cat := testCatalog()
+
+	t.Run("offered", func(t *testing.T) {
+		must.True(t, productOffersRegion(cat, 1, 3))
+	})
+	t.Run("not offered", func(t *testing.T) {
+		must.False(t, productOffersRegion(cat, 1, 4))
+	})
+	t.Run("unknown product", func(t *testing.T) {
+		must.False(t, productOffersRegion(cat, 99, 3))
+	})
 }
 
 func TestResolveProduct(t *testing.T) {

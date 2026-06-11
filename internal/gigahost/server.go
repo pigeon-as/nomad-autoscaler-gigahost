@@ -7,12 +7,28 @@ import (
 	"context"
 	"net/http"
 	"path"
+	"strings"
 )
 
 type Server struct {
-	SrvID   string `json:"srv_id"`
-	SrvName string `json:"srv_name"`
+	SrvID            string      `json:"srv_id"`
+	SrvStatus        flexBool    `json:"srv_status"`
+	SrvStatusInstall flexBool    `json:"srv_status_install"`
+	Order            ServerOrder `json:"order"`
 }
+
+type ServerOrder struct {
+	OrderID     string `json:"order_id"`
+	OrderStatus string `json:"order_status"`
+}
+
+func (s Server) Installing() bool { return bool(s.SrvStatusInstall) }
+
+func (s Server) Running() bool { return bool(s.SrvStatus) }
+
+// Cancelled servers linger in the server list; like the TF provider's Read,
+// treat them as deleted.
+func (s Server) Cancelled() bool { return strings.EqualFold(s.Order.OrderStatus, "cancelled") }
 
 func (c *Client) ListServers(ctx context.Context) ([]Server, error) {
 	req, err := c.newRequest(ctx, http.MethodGet, "servers", nil, nil)

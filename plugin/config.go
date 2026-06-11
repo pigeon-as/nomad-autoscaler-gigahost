@@ -12,11 +12,16 @@ import (
 // Agent-level keys (read in SetConfig).
 const (
 	configKeyAPIToken = "gigahost_api_token"
-	configKeyBaseURL  = "gigahost_base_url"
+	// Test-only API address override; intentionally not in the README.
+	configKeyBaseURL = "gigahost_base_url"
+	// Bounds the post-scale-out wait for nodes to join the pool (10s/attempt).
+	configKeyRetryAttempts = "retry_attempts"
+
+	configValueRetryAttemptsDefault = "60"
 )
 
-// Per-policy keys (read in Scale/scaleOut). product/region/OS mirror the TF
-// provider's gigahost_server inputs and are resolved to catalog ids at scale-out.
+// Per-policy keys; product/region/OS mirror the TF provider's gigahost_server
+// inputs and are resolved to catalog ids at scale-out.
 const (
 	configKeyProductName = "gigahost_product_name"
 	configKeyRegion      = "gigahost_region"

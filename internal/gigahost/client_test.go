@@ -57,7 +57,10 @@ func TestClientListServers(t *testing.T) {
 		must.Eq(t, "/api/v0/servers", r.URL.Path)
 		must.Eq(t, "Bearer test-token", r.Header.Get("Authorization"))
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"meta":{},"data":[{"srv_id":"42","srv_name":"worker-1"}]}`))
+		_, _ = w.Write([]byte(`{"meta":{},"data":[
+			{"srv_id":"42","srv_status":"0","srv_status_install":"1","order":{"order_id":"100","order_status":"active"}},
+			{"srv_id":"43","srv_status":"1","srv_status_install":"0","order":{"order_id":"101","order_status":"Cancelled"}}
+		]}`))
 	}))
 	defer srv.Close()
 
@@ -66,8 +69,15 @@ func TestClientListServers(t *testing.T) {
 
 	servers, err := c.ListServers(context.Background())
 	must.NoError(t, err)
-	must.Eq(t, 1, len(servers))
+	must.Eq(t, 2, len(servers))
 	must.Eq(t, "42", servers[0].SrvID)
+	must.True(t, servers[0].Installing())
+	must.False(t, servers[0].Running())
+	must.False(t, servers[0].Cancelled())
+	must.Eq(t, "100", servers[0].Order.OrderID)
+	must.False(t, servers[1].Installing())
+	must.True(t, servers[1].Running())
+	must.True(t, servers[1].Cancelled())
 }
 
 func TestClientCancelServerNotFound(t *testing.T) {
@@ -88,4 +98,38 @@ func TestClientCancelServerNotFound(t *testing.T) {
 func TestNewClientRequiresToken(t *testing.T) {
 	_, err := NewClient(&Config{})
 	must.Error(t, err)
+}
+
+func TestClientDeployQuantity(t *testing.T) {
+	cases := map[string]struct {
+		quantity int64
+		want     float64
+	}{
+		"explicit batch":   {quantity: 3, want: 3},
+		"zero defaults to": {quantity: 0, want: 1},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			var body map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				must.Eq(t, "/api/v0/deploy/servers", r.URL.Path)
+				must.NoError(t, json.NewDecoder(r.Body).Decode(&body))
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"meta":{},"data":{"order_ids":[1,2,3]}}`))
+			}))
+			defer srv.Close()
+
+			c, err := NewClient(&Config{Address: srv.URL + "/api/v0", Token: "test-token"})
+			must.NoError(t, err)
+
+			result, err := c.Deploy(context.Background(), DeployInput{
+				ProductID: 1, PriceID: 2, RegionID: 3, Quantity: tc.quantity,
+			})
+			must.NoError(t, err)
+			q, ok := body["quantity"].(float64)
+			must.True(t, ok)
+			must.Eq(t, tc.want, q)
+			must.Eq(t, 3, len(result.OrderIDs))
+		})
+	}
 }

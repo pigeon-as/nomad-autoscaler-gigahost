@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 // Name -> catalog id resolution, ported from terraform-provider-gigahost's
-// server_resolvers.go so policies use the same product/region/OS vocabulary as
-// the gigahost_server resource.
+// server_resolvers.go.
 package plugin
 
 import (
@@ -83,6 +82,22 @@ func resolveOS(catalog []gigahost.OSCatalogEntry, distro, version string) (int64
 		}
 		return 0, fmt.Errorf("%d OS images match distro %q version %q (%s); narrow gigahost_os_version", len(matches), distro, version, strings.Join(names, ", "))
 	}
+}
+
+func productOffersRegion(catalog *gigahost.DeployCatalog, productID, regionID int64) bool {
+	for _, t := range catalog.Tiers {
+		for _, p := range t.Products {
+			if p.ProductID == productID {
+				for _, id := range p.RegionIDs {
+					if id == regionID {
+						return true
+					}
+				}
+				return false
+			}
+		}
+	}
+	return false
 }
 
 func osMatches(e gigahost.OSCatalogEntry, distro, version string) bool {

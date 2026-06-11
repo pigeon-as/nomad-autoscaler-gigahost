@@ -6,6 +6,8 @@ package plugin
 import (
 	"context"
 	"fmt"
+	"strconv"
+	"sync/atomic"
 
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad-autoscaler/plugins/base"
@@ -31,10 +33,20 @@ var (
 )
 
 type TargetPlugin struct {
-	config       map[string]string
-	logger       hclog.Logger
-	client       *gigahost.Client
-	nomad        *nomadapi.Client
+	config map[string]string
+	logger hclog.Logger
+	client *gigahost.Client
+	nomad  *nomadapi.Client
+
+	retryAttempts int
+
+	// scaleInFlight holds Status not-ready while a Scale call executes — the
+	// plugin-side analogue of aws-asg's activity-in-progress check. The eval
+	// pipeline does not serialize Scale calls and cooldown only starts when
+	// Scale returns, so without it a new eval double-deploys in the
+	// install-done -> Nomad-join gap (observed live).
+	scaleInFlight atomic.Bool
+
 	clusterUtils *scaleutils.ClusterScaleUtils
 }
 
@@ -68,6 +80,12 @@ func (t *TargetPlugin) SetConfig(config map[string]string) error {
 	t.clusterUtils = clusterUtils
 	t.clusterUtils.ClusterNodeIDLookupFunc = gigahostNodeIDMap
 
+	retryLimit, err := strconv.Atoi(getConfigValue(config, configKeyRetryAttempts, configValueRetryAttemptsDefault))
+	if err != nil {
+		return err
+	}
+	t.retryAttempts = retryLimit
+
 	return nil
 }
 
@@ -79,6 +97,9 @@ func (t *TargetPlugin) Scale(action sdk.ScalingAction, config map[string]string)
 	if action.Count == sdk.StrategyActionMetaValueDryRunCount {
 		return nil
 	}
+
+	t.scaleInFlight.Store(true)
+	defer t.scaleInFlight.Store(false)
 
 	ctx := context.Background()
 
@@ -107,6 +128,10 @@ func (t *TargetPlugin) Scale(action sdk.ScalingAction, config map[string]string)
 }
 
 func (t *TargetPlugin) Status(config map[string]string) (*sdk.TargetStatus, error) {
+	if t.scaleInFlight.Load() {
+		return &sdk.TargetStatus{Ready: false}, nil
+	}
+
 	ready, err := t.clusterUtils.IsPoolReady(config)
 	if err != nil {
 		return nil, fmt.Errorf("failed to run Nomad node readiness check: %v", err)
@@ -126,6 +151,22 @@ func (t *TargetPlugin) Status(config map[string]string) (*sdk.TargetStatus, erro
 		Meta:  make(map[string]string),
 	}
 
+	// Provider-side in-flight guard (cf. aws-asg activity progress): not ready
+	// while any account server is installing. Survives restarts, account-wide
+	// by necessity (no grouping API).
+	servers, err := t.client.ListServers(context.Background())
+	if err != nil {
+		return nil, fmt.Errorf("failed to list Gigahost servers: %v", err)
+	}
+	for _, s := range servers {
+		if s.Installing() && !s.Cancelled() {
+			t.logger.Debug("server installing, reporting target not ready",
+				"server_id", s.SrvID)
+			resp.Ready = false
+			break
+		}
+	}
+
 	return &resp, nil
 }
 
@@ -140,7 +181,9 @@ func (t *TargetPlugin) calculateDirection(current, strategyDesired int64) (int64
 	return 0, ""
 }
 
-// Gigahost has no cloud-side group; the ready Nomad pool count stands in for it.
+// The Nomad pool stands in for the cloud-side group. Requiring eligibility is
+// stricter than the SDK's FilterNodes on purpose: an ineligible node is not
+// capacity the strategy can use.
 func (t *TargetPlugin) countPoolNodes(config map[string]string) (int64, error) {
 	poolID, err := nodepool.NewClusterNodePoolIdentifier(config)
 	if err != nil {
@@ -154,9 +197,28 @@ func (t *TargetPlugin) countPoolNodes(config map[string]string) (int64, error) {
 
 	var count int64
 	for _, node := range nodes {
-		if node.Status == nomadapi.NodeStatusReady && !node.Drain && poolID.IsPoolMember(node) {
+		if node.Status == nomadapi.NodeStatusReady && !node.Drain &&
+			node.SchedulingEligibility == nomadapi.NodeSchedulingEligible &&
+			poolID.IsPoolMember(node) {
 			count++
 		}
 	}
 	return count, nil
+}
+
+// ensurePoolNodesCount is the analogue of aws-asg's ensureASGInstancesCount:
+// wait until our count source — the Nomad pool — reflects the new capacity.
+func (t *TargetPlugin) ensurePoolNodesCount(ctx context.Context, config map[string]string, desired int64) error {
+	f := func(ctx context.Context) (bool, error) {
+		count, err := t.countPoolNodes(config)
+		if err != nil {
+			return true, err
+		}
+		if count >= desired {
+			return true, nil
+		}
+		return false, fmt.Errorf("Nomad pool at %d nodes of desired %d", count, desired)
+	}
+
+	return retry(ctx, defaultRetryInterval, t.retryAttempts, f)
 }
