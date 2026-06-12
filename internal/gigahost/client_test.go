@@ -58,8 +58,8 @@ func TestClientListServers(t *testing.T) {
 		must.Eq(t, "Bearer test-token", r.Header.Get("Authorization"))
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"meta":{},"data":[
-			{"srv_id":"42","srv_status":"0","srv_status_install":"1","order":{"order_id":"100","order_status":"active"}},
-			{"srv_id":"43","srv_status":"1","srv_status_install":"0","order":{"order_id":"101","order_status":"Cancelled"}}
+			{"srv_id":"42","srv_status":"0","srv_status_install":"1","srv_date_created":"1781282056","srv_deleted_date":"0","order":{"order_id":"100","order_status":"active"}},
+			{"srv_id":"43","srv_status":"1","srv_status_install":"0","srv_date_created":"1781280000","srv_deleted_date":"1781283000","order":{"order_id":"101","order_status":"Cancelled"}}
 		]}`))
 	}))
 	defer srv.Close()
@@ -75,9 +75,46 @@ func TestClientListServers(t *testing.T) {
 	must.False(t, servers[0].Running())
 	must.False(t, servers[0].Cancelled())
 	must.Eq(t, "100", servers[0].Order.OrderID)
+	must.Eq(t, int64(1781282056), servers[0].Created())
+	must.Eq(t, int64(0), servers[0].Deleted())
 	must.False(t, servers[1].Installing())
 	must.True(t, servers[1].Running())
 	must.True(t, servers[1].Cancelled())
+	must.Eq(t, int64(1781283000), servers[1].Deleted())
+}
+
+func TestClientGetServer(t *testing.T) {
+	t.Run("found (array-wrapped)", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			must.Eq(t, "/api/v0/servers/42", r.URL.Path)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"meta":{},"data":[{"srv_id":"42","srv_status":"1","order":{"order_status":"active"}}]}`))
+		}))
+		defer srv.Close()
+
+		c, err := NewClient(&Config{Address: srv.URL + "/api/v0", Token: "test-token"})
+		must.NoError(t, err)
+
+		s, err := c.GetServer(context.Background(), "42")
+		must.NoError(t, err)
+		must.Eq(t, "42", s.SrvID)
+		must.True(t, s.Running())
+	})
+
+	t.Run("404 is ErrNotFound", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"meta":{"message":"404 Not Found"},"data":[]}`))
+		}))
+		defer srv.Close()
+
+		c, err := NewClient(&Config{Address: srv.URL + "/api/v0", Token: "test-token"})
+		must.NoError(t, err)
+
+		_, err = c.GetServer(context.Background(), "42")
+		must.Error(t, err)
+		must.True(t, errors.Is(err, ErrNotFound))
+	})
 }
 
 func TestClientCancelServerNotFound(t *testing.T) {

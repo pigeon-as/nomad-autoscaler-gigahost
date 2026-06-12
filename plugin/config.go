@@ -12,24 +12,22 @@ import (
 // Agent-level keys (read in SetConfig).
 const (
 	configKeyAPIToken = "gigahost_api_token"
-	// Test-only API address override; intentionally not in the README.
-	configKeyBaseURL = "gigahost_base_url"
-	// Bounds the post-scale-out wait for nodes to join the pool (10s/attempt).
+	// Test-only API address override.
+	configKeyBaseURL       = "gigahost_base_url"
 	configKeyRetryAttempts = "retry_attempts"
 
 	configValueRetryAttemptsDefault = "60"
 )
 
-// Per-policy keys; product/region/OS mirror the TF provider's gigahost_server
-// inputs and are resolved to catalog ids at scale-out.
+// Per-policy keys, resolved to catalog ids at scale-out.
 const (
-	configKeyProductName = "gigahost_product_name"
-	configKeyRegion      = "gigahost_region"
-	configKeyOSDistro    = "gigahost_os_distro"
-	configKeyOSVersion   = "gigahost_os_version"
-	configKeySSHKeys     = "gigahost_ssh_keys"
-	configKeyHostname    = "gigahost_hostname"
-	configKeyBackups     = "gigahost_backups"
+	configKeyProductName    = "gigahost_product_name"
+	configKeyRegion         = "gigahost_region"
+	configKeyOSDistro       = "gigahost_os_distro"
+	configKeyOSVersion      = "gigahost_os_version"
+	configKeySSHKeys        = "gigahost_ssh_keys"
+	configKeyHostnamePrefix = "gigahost_hostname_prefix"
+	configKeyBackups        = "gigahost_backups"
 )
 
 func getConfigValue(config map[string]string, key, defaultValue string) string {

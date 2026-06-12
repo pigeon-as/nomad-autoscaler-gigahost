@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strconv"
 	"sync/atomic"
+	"time"
 
 	hclog "github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/nomad-autoscaler/plugins/base"
@@ -40,11 +41,9 @@ type TargetPlugin struct {
 
 	retryAttempts int
 
-	// scaleInFlight holds Status not-ready while a Scale call executes — the
-	// plugin-side analogue of aws-asg's activity-in-progress check. The eval
-	// pipeline does not serialize Scale calls and cooldown only starts when
-	// Scale returns, so without it a new eval double-deploys in the
-	// install-done -> Nomad-join gap (observed live).
+	// scaleInFlight holds Status not-ready while a Scale call executes: evals
+	// are not serialized and cooldown only starts when Scale returns, so
+	// without it a new eval can double-deploy.
 	scaleInFlight atomic.Bool
 
 	clusterUtils *scaleutils.ClusterScaleUtils
@@ -151,9 +150,8 @@ func (t *TargetPlugin) Status(config map[string]string) (*sdk.TargetStatus, erro
 		Meta:  make(map[string]string),
 	}
 
-	// Provider-side in-flight guard (cf. aws-asg activity progress): not ready
-	// while any account server is installing. Survives restarts, account-wide
-	// by necessity (no grouping API).
+	// Not ready while any account server is installing — account-wide by
+	// necessity, there is no grouping API.
 	servers, err := t.client.ListServers(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("failed to list Gigahost servers: %v", err)
@@ -167,10 +165,32 @@ func (t *TargetPlugin) Status(config map[string]string) (*sdk.TargetStatus, erro
 		}
 	}
 
+	// The newest creation/deletion is the last scaling event; it makes policy
+	// cooldown survive autoscaler restarts.
+	if last := lastEventNanos(servers); last > 0 {
+		resp.Meta[sdk.TargetStatusMetaKeyLastEvent] = strconv.FormatInt(last, 10)
+	}
+
 	return &resp, nil
 }
 
-// Identical to aws-asg/gce-mig: delta for scale-in, absolute desired total for scale-out.
+// lastEventNanos returns the newest server creation or deletion time in
+// UnixNano (the unit the policy handler expects), 0 when unknown.
+func lastEventNanos(servers []gigahost.Server) int64 {
+	var last int64
+	for _, s := range servers {
+		if ts := s.Created(); ts > last {
+			last = ts
+		}
+		if ts := s.Deleted(); ts > last {
+			last = ts
+		}
+	}
+	return last * int64(time.Second)
+}
+
+// calculateDirection returns the delta for scale-in, the absolute desired
+// total for scale-out.
 func (t *TargetPlugin) calculateDirection(current, strategyDesired int64) (int64, string) {
 	if strategyDesired < current {
 		return current - strategyDesired, "in"
@@ -181,9 +201,8 @@ func (t *TargetPlugin) calculateDirection(current, strategyDesired int64) (int64
 	return 0, ""
 }
 
-// The Nomad pool stands in for the cloud-side group. Requiring eligibility is
-// stricter than the SDK's FilterNodes on purpose: an ineligible node is not
-// capacity the strategy can use.
+// countPoolNodes counts the ready, eligible Nomad nodes in the pool — the
+// count source, as there is no cloud-side group.
 func (t *TargetPlugin) countPoolNodes(config map[string]string) (int64, error) {
 	poolID, err := nodepool.NewClusterNodePoolIdentifier(config)
 	if err != nil {
@@ -206,8 +225,7 @@ func (t *TargetPlugin) countPoolNodes(config map[string]string) (int64, error) {
 	return count, nil
 }
 
-// ensurePoolNodesCount is the analogue of aws-asg's ensureASGInstancesCount:
-// wait until our count source — the Nomad pool — reflects the new capacity.
+// ensurePoolNodesCount waits until the Nomad pool reflects the new capacity.
 func (t *TargetPlugin) ensurePoolNodesCount(ctx context.Context, config map[string]string, desired int64) error {
 	f := func(ctx context.Context) (bool, error) {
 		count, err := t.countPoolNodes(config)

@@ -17,7 +17,7 @@ type DeployInput struct {
 	RegionID  int64
 	Quantity  int64
 	OSID      *int64
-	Hostname  string
+	Hostnames []string
 	SSHKeys   []int64
 	Backups   bool
 }
@@ -43,19 +43,17 @@ func (c *Client) Deploy(ctx context.Context, in DeployInput) (*DeployResult, err
 		quantity = 1
 	}
 	body := deployRequest{
-		Pid:      in.ProductID,
-		PriceID:  in.PriceID,
-		RegionID: in.RegionID,
-		Quantity: quantity,
-		OSID:     in.OSID,
-		SSHKeys:  in.SSHKeys,
+		Pid:       in.ProductID,
+		PriceID:   in.PriceID,
+		RegionID:  in.RegionID,
+		Quantity:  quantity,
+		OSID:      in.OSID,
+		Hostnames: in.Hostnames,
+		SSHKeys:   in.SSHKeys,
 	}
 	if in.Backups {
 		v := int64(1)
 		body.Backups = &v
-	}
-	if in.Hostname != "" {
-		body.Hostnames = []string{in.Hostname}
 	}
 
 	req, err := c.newRequest(ctx, http.MethodPost, "deploy/servers", nil, body)

@@ -1,9 +1,5 @@
-# Nomad dev agent config for e2e testing of the autoscaler plugin.
-# Run via: make dev
-#
-# The node_class makes the dev node targetable by the scale-in policy: the
-# autoscaler canonicalizes nomad-apm cluster queries with the target's
-# node_class only, and empty-class pool matching is unreliable.
+# Nomad dev agent for the e2e tests (make dev). nomad-apm cluster queries
+# need a node_class.
 
 log_level = "INFO"
 

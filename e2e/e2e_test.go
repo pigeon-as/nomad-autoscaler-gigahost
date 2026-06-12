@@ -24,10 +24,7 @@ import (
 	"github.com/pigeon-as/nomad-autoscaler-gigahost/internal/gigahost"
 )
 
-const (
-	autoscalerAddr = "http://127.0.0.1:8080"
-	nodeMetaKey    = "unique.platform.gigahost.server_id"
-)
+const autoscalerAddr = "http://127.0.0.1:8080"
 
 var (
 	autoscalerProc *exec.Cmd
@@ -90,14 +87,12 @@ func startAutoscaler() error {
 		return fmt.Errorf("copying plugin binary: %v", err)
 	}
 
-	// Policy files are written/removed per lifecycle test so they never run
-	// concurrently.
+	// Policy files are written/removed per lifecycle test.
 	policyDir = filepath.Join(tmpDir, "policies")
 	os.MkdirAll(policyDir, 0o755)
 
-	// driver must equal the plugin binary filename. retry_attempts is lowered
-	// so a scale-out whose node never joins the dev Nomad releases the
-	// in-flight guard quickly.
+	// retry_attempts is lowered so a scale-out whose node never joins the dev
+	// Nomad releases the in-flight guard quickly.
 	cfg := fmt.Sprintf(`log_level  = "DEBUG"
 plugin_dir = %q
 
@@ -179,7 +174,7 @@ func writeScaleOutPolicy(dir string) error {
 
   policy {
     evaluation_interval = "10s"
-    cooldown            = "5m"
+    cooldown            = "1m"
     on_check_error      = "ignore"
 
     check "placeholder" {
@@ -199,7 +194,7 @@ func writeScaleOutPolicy(dir string) error {
       gigahost_os_distro    = %q
       gigahost_os_version   = %q
       gigahost_ssh_keys     = %q
-      gigahost_hostname     = %q
+      gigahost_hostname_prefix = %q
     }
   }
 }
@@ -214,8 +209,7 @@ func writeScaleOutPolicy(dir string) error {
 }
 
 // Scale from 2 nodes to 1: the autoscaler forces min=1 on nomad-apm cluster
-// policies (scaling to 0 is unsupported). The class must be explicit —
-// cluster queries are canonicalized with the target's node_class only.
+// policies, and canonicalizes their queries with the target's node_class only.
 func writeScaleInPolicy(dir string) error {
 	policy := `scaling "e2e-in" {
   enabled = true
@@ -224,7 +218,7 @@ func writeScaleInPolicy(dir string) error {
 
   policy {
     evaluation_interval = "10s"
-    cooldown            = "5m"
+    cooldown            = "1m"
     on_check_error      = "ignore"
 
     check "placeholder" {
@@ -253,8 +247,7 @@ func envOrDefault(key, def string) string {
 	return def
 }
 
-// The file policy source has no file watching — it re-scans only on SIGHUP,
-// so every policy file change must be followed by a reload.
+// The file policy source re-scans only on SIGHUP.
 func reloadPolicies(t *testing.T) {
 	t.Helper()
 	if autoscalerProc == nil || autoscalerProc.Process == nil {
@@ -342,8 +335,7 @@ func resolveDeployInput(t *testing.T, c *gigahost.Client) gigahost.DeployInput {
 }
 
 // Installing servers would hold the plugin's install-guard. Ones we did not
-// create are ghosts (orders have materialized 25-40 min late) and are
-// cancelled on sight — dedicated test account.
+// create are ghosts (orders can materialize very late) and are cancelled.
 func waitNoInstalling(t *testing.T, c *gigahost.Client, ours ...string) {
 	t.Helper()
 	protected := make(map[string]bool, len(ours))
@@ -380,8 +372,6 @@ func waitNoInstalling(t *testing.T, c *gigahost.Client, ours ...string) {
 	}
 }
 
-// A node the APM/plugin cannot see turns into a blind eval no-op — fail with
-// the node state instead.
 func waitNodeReady(t *testing.T, nc *nomadapi.Client, nodeID string) {
 	t.Helper()
 	deadline := time.After(2 * time.Minute)
@@ -402,8 +392,8 @@ func waitNodeReady(t *testing.T, nc *nomadapi.Client, nodeID string) {
 	}
 }
 
-// The status view can omit in-flight orders; the server list, matched by
-// order id, is the durable completion source (mirrors the plugin).
+// The status view can omit in-flight orders, so the server list, matched by
+// order id, completes the wait.
 func waitServersReady(t *testing.T, c *gigahost.Client, orderIDs []int64, want int) []string {
 	t.Helper()
 	orderSet := make(map[int64]bool, len(orderIDs))
@@ -474,10 +464,9 @@ func TestPluginHealthy(t *testing.T) {
 	must.Eq(t, 200, resp.StatusCode)
 }
 
-// Two real servers are deployed (one batch order) and mapped onto the two
-// class nodes via dynamic node meta; a min=1 policy then drives drain -> meta
-// lookup -> CancelServer -> ensureServersGone for exactly one of them, live.
-// Requires both make dev and make dev2.
+// Two real servers are deployed (one batch order) and renamed to the two
+// class nodes' hostnames; a min=1 policy then makes the autoscaler drain one
+// node and cancel exactly its server, live.
 func TestScaleInLifecycle(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping: -short")
@@ -491,6 +480,7 @@ func TestScaleInLifecycle(t *testing.T) {
 
 	nomadClient, err := nomadapi.NewClient(nomadapi.DefaultConfig())
 	must.NoError(t, err)
+	startSecondClient(t)
 	nodeIDs := waitClassNodes(t, nomadClient, 2)
 
 	in := resolveDeployInput(t, client)
@@ -507,22 +497,18 @@ func TestScaleInLifecycle(t *testing.T) {
 		}
 	})
 
-	// Dynamic node meta — the same key workers set during bootstrap.
+	// Rename each server to a dev node's fingerprinted hostname; in production
+	// the deploy itself sets the hostname.
 	for i, nodeID := range nodeIDs {
-		srvID := srvIDs[i]
-		_, err = nomadClient.Nodes().Meta().Apply(&nomadapi.NodeMetaApplyRequest{
-			NodeID: nodeID,
-			Meta:   map[string]*string{nodeMetaKey: &srvID},
-		}, nil)
+		node, _, err := nomadClient.Nodes().Info(nodeID, nil)
 		must.NoError(t, err)
-		t.Logf("mapped Nomad node %s to server %s", nodeID, srvID)
+		hostname := node.Attributes["unique.hostname"]
+		must.True(t, hostname != "")
+		must.NoError(t, client.UpdateServerName(ctx, srvIDs[i], hostname))
+		t.Logf("renamed server %s to node hostname %q (node %s)", srvIDs[i], hostname, nodeID)
 	}
 	t.Cleanup(func() {
 		for _, nodeID := range nodeIDs {
-			_, _ = nomadClient.Nodes().Meta().Apply(&nomadapi.NodeMetaApplyRequest{
-				NodeID: nodeID,
-				Meta:   map[string]*string{nodeMetaKey: nil},
-			}, nil)
 			_, _ = nomadClient.Nodes().ToggleEligibility(nodeID, true, nil)
 		}
 	})
@@ -581,8 +567,27 @@ func TestScaleInLifecycle(t *testing.T) {
 	}
 }
 
-// waitClassNodes waits for n ready, eligible nodes of the e2e node class —
-// the dev agent (make dev) plus the second client (make dev2).
+// startSecondClient runs a second Nomad client in its own UTS namespace so it
+// fingerprints a distinct hostname (hostnames are node identity); the cgroup
+// remount lets it manage cgroups rootlessly.
+func startSecondClient(t *testing.T) {
+	t.Helper()
+	cfg, err := filepath.Abs("client2.hcl")
+	must.NoError(t, err)
+	os.RemoveAll("/tmp/nomad-client2") //nolint:errcheck
+	cmd := exec.Command("unshare", "--user", "--map-root-user", "--uts", "--cgroup", "--mount",
+		"bash", "-c", "mount -t cgroup2 cgroup2 /sys/fs/cgroup && hostname e2e-node-b && exec nomad agent -config "+cfg)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	must.NoError(t, cmd.Start())
+	t.Cleanup(func() {
+		cmd.Process.Kill()                 //nolint:errcheck
+		cmd.Wait()                         //nolint:errcheck
+		os.RemoveAll("/tmp/nomad-client2") //nolint:errcheck
+	})
+}
+
+// waitClassNodes waits for n ready, eligible nodes of the e2e node class.
 func waitClassNodes(t *testing.T, nc *nomadapi.Client, n int) []string {
 	t.Helper()
 	deadline := time.After(2 * time.Minute)
@@ -602,7 +607,7 @@ func waitClassNodes(t *testing.T, nc *nomadapi.Client, n int) []string {
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("expected %d ready nodes of class gigahost-e2e-node, found %d — is make dev2 running?", n, len(ids))
+			t.Fatalf("expected %d ready nodes of class gigahost-e2e-node, found %d", n, len(ids))
 		case <-time.After(5 * time.Second):
 		}
 	}
@@ -627,13 +632,13 @@ func TestScaleLifecycle(t *testing.T) {
 
 	client := newGigahostClient(t)
 
-	// No server-side tag filter and hostnames don't round-trip, so detection
-	// and cleanup diff the whole account list — DEDICATED test account required.
+	// Detection and cleanup diff the whole account list — DEDICATED test
+	// account required.
 	before, err := listServerIDs(client)
 	must.NoError(t, err)
 
-	// LIFO: policy removal (+ straggler settle) must run BEFORE this diff
-	// cancel, or an in-flight eval deploys after the snapshot and escapes it.
+	// LIFO: policy removal (+ settle) must run BEFORE this diff cancel, or an
+	// in-flight eval deploys after the snapshot and escapes it.
 	t.Cleanup(func() {
 		after, _ := listServerIDs(client)
 		known := make(map[string]bool, len(before))
@@ -654,8 +659,7 @@ func TestScaleLifecycle(t *testing.T) {
 		os.Remove(filepath.Join(policyDir, "e2e-out.hcl")) //nolint:errcheck
 		reloadPolicies(t)
 		// The eval broker can redeliver a failed eval after its policy is
-		// removed (observed at +76s); outlast it so the cancel sweep catches
-		// anything it deploys.
+		// removed; outlast it so the cancel sweep catches anything it deploys.
 		t.Log("cleanup: policy removed, settling before cancel sweep...")
 		time.Sleep(120 * time.Second)
 	})
