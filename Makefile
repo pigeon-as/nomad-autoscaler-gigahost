@@ -21,8 +21,5 @@ e2e: build
 dev:
 	nomad agent -dev -config=$(abspath e2e/agent.hcl)
 
-dev2:
-	nomad agent -config=$(abspath e2e/client2.hcl)
-
 clean:
 	rm -rf $(BUILD_DIR)

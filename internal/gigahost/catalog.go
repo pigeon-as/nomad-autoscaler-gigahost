@@ -64,8 +64,8 @@ type OSCatalogEntry struct {
 	OS     OSImage
 }
 
-// GetOSCatalog flattens distros and their versions into one list (one GET per
-// distro), mirroring terraform-provider-gigahost.
+// GetOSCatalog flattens distros and their versions into one list (one GET
+// per distro).
 func (c *Client) GetOSCatalog(ctx context.Context) ([]OSCatalogEntry, error) {
 	distros, err := c.getDistros(ctx)
 	if err != nil {

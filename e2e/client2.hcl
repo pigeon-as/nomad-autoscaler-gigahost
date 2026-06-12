@@ -1,6 +1,5 @@
-# Second Nomad client for the scale-in e2e. The autoscaler forces min=1 on
-# nomad-apm cluster policies (scaling to 0 is unsupported), so scale-in is
-# exercised from 2 nodes down to 1. Run via: make dev2 (next to make dev).
+# Second Nomad client for the scale-in e2e; the test starts it itself in its
+# own UTS namespace.
 
 log_level  = "WARN"
 datacenter = "dc1"

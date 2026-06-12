@@ -11,7 +11,6 @@ import (
 	"time"
 
 	hclog "github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/nomad-autoscaler/sdk/helper/scaleutils"
 	nomadapi "github.com/hashicorp/nomad/api"
 	"github.com/shoenig/test/must"
 
@@ -45,47 +44,76 @@ func TestCalculateDirection(t *testing.T) {
 func TestGigahostNodeIDMap(t *testing.T) {
 	t.Parallel()
 
-	t.Run("attribute present", func(t *testing.T) {
-		n := &nomadapi.Node{Attributes: map[string]string{nodeAttrGigahostServerID: "42"}}
+	t.Run("hostname present", func(t *testing.T) {
+		n := &nomadapi.Node{Attributes: map[string]string{nodeAttrHostname: "worker-ab12cd"}}
 		id, err := gigahostNodeIDMap(n)
 		must.NoError(t, err)
-		must.Eq(t, "42", id)
+		must.Eq(t, "worker-ab12cd", id)
 	})
 
-	t.Run("meta fallback", func(t *testing.T) {
-		n := &nomadapi.Node{
-			Attributes: map[string]string{},
-			Meta:       map[string]string{nodeAttrGigahostServerID: "43"},
-		}
-		id, err := gigahostNodeIDMap(n)
-		must.NoError(t, err)
-		must.Eq(t, "43", id)
-	})
-
-	t.Run("attribute wins over meta", func(t *testing.T) {
-		n := &nomadapi.Node{
-			Attributes: map[string]string{nodeAttrGigahostServerID: "42"},
-			Meta:       map[string]string{nodeAttrGigahostServerID: "43"},
-		}
-		id, err := gigahostNodeIDMap(n)
-		must.NoError(t, err)
-		must.Eq(t, "42", id)
-	})
-
-	t.Run("missing everywhere", func(t *testing.T) {
-		n := &nomadapi.Node{Attributes: map[string]string{}, Meta: map[string]string{}}
+	t.Run("hostname missing", func(t *testing.T) {
+		n := &nomadapi.Node{Attributes: map[string]string{}}
 		_, err := gigahostNodeIDMap(n)
 		must.Error(t, err)
 	})
 
-	t.Run("empty values", func(t *testing.T) {
-		n := &nomadapi.Node{
-			Attributes: map[string]string{nodeAttrGigahostServerID: ""},
-			Meta:       map[string]string{nodeAttrGigahostServerID: ""},
-		}
+	t.Run("hostname empty", func(t *testing.T) {
+		n := &nomadapi.Node{Attributes: map[string]string{nodeAttrHostname: ""}}
 		_, err := gigahostNodeIDMap(n)
 		must.Error(t, err)
 	})
+}
+
+func TestLastEventNanos(t *testing.T) {
+	t.Parallel()
+
+	must.Eq(t, int64(0), lastEventNanos(nil))
+	must.Eq(t, int64(0), lastEventNanos([]gigahost.Server{{}}))
+
+	servers := []gigahost.Server{
+		{SrvDateCreated: 1781280000},
+		{SrvDateCreated: 1781281000, SrvDeletedDate: 1781283000},
+		{SrvDateCreated: 1781282000},
+	}
+	must.Eq(t, int64(1781283000)*int64(time.Second), lastEventNanos(servers))
+}
+
+func TestServerNameIndex(t *testing.T) {
+	t.Parallel()
+	tp := &TargetPlugin{logger: testLogger()}
+
+	names, srvIDFor := tp.serverNameIndex([]gigahost.Server{
+		{SrvID: "42", SrvName: "worker-aaaaaa"},
+		{SrvID: "43", SrvName: "worker-bbbbbb"},
+		{SrvID: "44", SrvName: ""},
+		{SrvID: "45", SrvName: "worker-gone", Order: gigahost.ServerOrder{OrderStatus: "cancelled"}},
+		{SrvID: "46", SrvName: "worker-dup"},
+		{SrvID: "47", SrvName: "worker-dup"},
+	})
+
+	must.Len(t, 2, names)
+	must.SliceContains(t, names, "worker-aaaaaa")
+	must.SliceContains(t, names, "worker-bbbbbb")
+	must.Eq(t, "42", srvIDFor["worker-aaaaaa"])
+	must.Eq(t, "43", srvIDFor["worker-bbbbbb"])
+	must.MapNotContainsKey(t, srvIDFor, "worker-dup")
+	must.MapNotContainsKey(t, srvIDFor, "worker-gone")
+	must.MapNotContainsKey(t, srvIDFor, "")
+}
+
+func TestHostnamesFor(t *testing.T) {
+	t.Parallel()
+
+	names, err := hostnamesFor("worker", 3)
+	must.NoError(t, err)
+	must.Len(t, 3, names)
+	seen := map[string]bool{}
+	for _, n := range names {
+		must.StrHasPrefix(t, "worker-", n)
+		must.Eq(t, len("worker-")+hostnameSuffixLen, len(n))
+		must.False(t, seen[n])
+		seen[n] = true
+	}
 }
 
 func TestRequireString(t *testing.T) {
@@ -209,30 +237,88 @@ func TestWaitForServersGone(t *testing.T) {
 }
 
 func TestEnsureServersGone(t *testing.T) {
+	origInterval := defaultRetryInterval
+	defaultRetryInterval = time.Millisecond
+	t.Cleanup(func() { defaultRetryInterval = origInterval })
+
+	t.Run("cancelled status counts as gone", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			must.Eq(t, "/servers/42", r.URL.Path)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"meta":{},"data":[{"srv_id":"42","order":{"order_status":"cancelled"}}]}`))
+		}))
+		defer srv.Close()
+
+		client, err := gigahost.NewClient(&gigahost.Config{Address: srv.URL, Token: "t"})
+		must.NoError(t, err)
+
+		tp := &TargetPlugin{client: client, retryAttempts: 2}
+		must.NoError(t, tp.ensureServersGone(context.Background(), []string{"42"}))
+	})
+
+	t.Run("404 is definitive", func(t *testing.T) {
+		polls := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			polls++
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"meta":{"message":"404 Not Found"},"data":[]}`))
+		}))
+		defer srv.Close()
+
+		client, err := gigahost.NewClient(&gigahost.Config{Address: srv.URL, Token: "t"})
+		must.NoError(t, err)
+
+		tp := &TargetPlugin{client: client, retryAttempts: 2}
+		must.NoError(t, tp.ensureServersGone(context.Background(), []string{"42"}))
+		must.Eq(t, 1, polls)
+	})
+}
+
+func TestDeleteServerRefusedCancellation(t *testing.T) {
 	t.Parallel()
 
-	cases := map[string]string{
-		"servers absent":    `{"meta":{},"data":[]}`,
-		"servers cancelled": `{"meta":{},"data":[{"srv_id":"42","order":{"order_status":"cancelled"}}]}`,
-	}
-	for name, body := range cases {
-		t.Run(name, func(t *testing.T) {
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(body))
-			}))
-			defer srv.Close()
+	t.Run("refused but confirmed gone", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.URL.Path {
+			case "/servers/42/cancel":
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"meta":{"message":"No order was found."},"data":[]}`))
+			case "/servers/42":
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = w.Write([]byte(`{"meta":{"message":"404 Not Found"},"data":[]}`))
+			}
+		}))
+		defer srv.Close()
 
-			client, err := gigahost.NewClient(&gigahost.Config{Address: srv.URL, Token: "t"})
-			must.NoError(t, err)
+		client, err := gigahost.NewClient(&gigahost.Config{Address: srv.URL, Token: "t"})
+		must.NoError(t, err)
 
-			tp := &TargetPlugin{client: client, retryAttempts: 1}
-			err = tp.ensureServersGone(context.Background(), []scaleutils.NodeResourceID{
-				{NomadNodeID: "n1", RemoteResourceID: "42"},
-			})
-			must.NoError(t, err)
-		})
-	}
+		tp := &TargetPlugin{client: client, logger: testLogger()}
+		must.NoError(t, tp.deleteServer(context.Background(), "42"))
+	})
+
+	t.Run("refused and still live", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			switch r.URL.Path {
+			case "/servers/42/cancel":
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"meta":{"message":"refused"},"data":[]}`))
+			case "/servers/42":
+				_, _ = w.Write([]byte(`{"meta":{},"data":[{"srv_id":"42","srv_status":"1","order":{"order_status":"active"}}]}`))
+			}
+		}))
+		defer srv.Close()
+
+		client, err := gigahost.NewClient(&gigahost.Config{Address: srv.URL, Token: "t"})
+		must.NoError(t, err)
+
+		tp := &TargetPlugin{client: client, logger: testLogger()}
+		err = tp.deleteServer(context.Background(), "42")
+		must.Error(t, err)
+		must.StrContains(t, err.Error(), "refused")
+	})
 }
 
 func TestProductOffersRegion(t *testing.T) {

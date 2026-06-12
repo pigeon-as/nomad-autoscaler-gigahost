@@ -14,27 +14,30 @@ import (
 )
 
 func (t *TargetPlugin) scaleIn(ctx context.Context, num int64, config map[string]string) error {
-	remoteIDs, err := t.listServerIDs(ctx)
+	servers, err := t.client.ListServers(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to list Gigahost servers: %v", err)
 	}
+	names, srvIDFor := t.serverNameIndex(servers)
 
-	ids, err := t.clusterUtils.RunPreScaleInTasksWithRemoteCheck(ctx, config, remoteIDs, int(num))
+	ids, err := t.clusterUtils.RunPreScaleInTasksWithRemoteCheck(ctx, config, names, int(num))
 	if err != nil {
 		return fmt.Errorf("failed to perform pre-scale Nomad scale in tasks: %v", err)
 	}
 
 	var successes, failures []scaleutils.NodeResourceID
+	var cancelled []string
 	for _, node := range ids {
+		srvID := srvIDFor[node.RemoteResourceID]
 		t.logger.Info("cancelling Gigahost server",
-			"node_id", node.NomadNodeID, "server_id", node.RemoteResourceID)
-		if err := t.deleteServer(ctx, node.RemoteResourceID); err != nil {
-			t.logger.Error("failed to cancel server",
-				"server_id", node.RemoteResourceID, "error", err)
+			"node_id", node.NomadNodeID, "name", node.RemoteResourceID, "server_id", srvID)
+		if err := t.deleteServer(ctx, srvID); err != nil {
+			t.logger.Error("failed to cancel server", "server_id", srvID, "error", err)
 			failures = append(failures, node)
 			continue
 		}
 		successes = append(successes, node)
+		cancelled = append(cancelled, srvID)
 	}
 
 	var failedTaskErr error
@@ -43,9 +46,9 @@ func (t *TargetPlugin) scaleIn(ctx context.Context, num int64, config map[string
 	}
 
 	if len(successes) > 0 {
-		// Non-fatal by design, but this is the billing alarm for a cancelled
-		// server that kept running.
-		if err := t.ensureServersGone(ctx, successes); err != nil {
+		// Non-fatal, but a cancelled server that keeps running is a billing
+		// problem.
+		if err := t.ensureServersGone(ctx, cancelled); err != nil {
 			t.logger.Error("failed to confirm cancelled servers terminated", "error", err)
 		}
 
@@ -66,10 +69,8 @@ func (t *TargetPlugin) scaleIn(ctx context.Context, num int64, config map[string
 	return nil
 }
 
-// Gigahost isn't a scale set — no resize API — so scale-out is one batch
-// deploy of (desired-current) servers, then a wait for the new nodes to join
-// the Nomad pool so the count source reflects the new capacity before Scale
-// returns.
+// scaleOut deploys the missing servers as one batch order, then waits for the
+// new nodes to join the Nomad pool before Scale returns.
 func (t *TargetPlugin) scaleOut(ctx context.Context, desired, current int64, config map[string]string) error {
 	productName, err := requireString(config, configKeyProductName)
 	if err != nil {
@@ -125,13 +126,14 @@ func (t *TargetPlugin) scaleOut(ctx context.Context, desired, current int64, con
 
 	toCreate := desired - current
 
-	// The deploy API applies one hostname per server; batches let Gigahost
-	// assign unique hostnames.
-	hostname := getConfigValue(config, configKeyHostname, "")
-	if hostname != "" && toCreate > 1 {
-		t.logger.Warn("ignoring configured hostname for multi-server scale out",
-			"hostname", hostname, "create_count", toCreate)
-		hostname = ""
+	// Server names become OS hostnames, which is how scale-in identifies nodes.
+	prefix, err := requireString(config, configKeyHostnamePrefix)
+	if err != nil {
+		return err
+	}
+	hostnames, err := hostnamesFor(prefix, toCreate)
+	if err != nil {
+		return err
 	}
 
 	in := gigahost.DeployInput{
@@ -139,7 +141,7 @@ func (t *TargetPlugin) scaleOut(ctx context.Context, desired, current int64, con
 		PriceID:   priceID,
 		RegionID:  regionID,
 		OSID:      &osID,
-		Hostname:  hostname,
+		Hostnames: hostnames,
 		SSHKeys:   sshKeys,
 		Backups:   backups,
 	}
@@ -154,8 +156,8 @@ func (t *TargetPlugin) scaleOut(ctx context.Context, desired, current int64, con
 	}
 	log.Info("servers deployed and ready", "server_ids", srvIDs)
 
-	// A server that deploys but never joins Nomad fails here (srv_id logged
-	// above) and is invisible to scale-in — operator attention required.
+	// A server that deploys but never joins Nomad fails here and is invisible
+	// to scale-in — cancel it manually.
 	if err := t.ensurePoolNodesCount(ctx, config, desired); err != nil {
 		return fmt.Errorf("failed to confirm scale out: waiting for Nomad pool to reach %d nodes: %v", desired, err)
 	}

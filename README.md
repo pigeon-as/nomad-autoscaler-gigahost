@@ -2,17 +2,7 @@
 
 Nomad Autoscaler [target plugin](https://developer.hashicorp.com/nomad/tools/autoscaling/plugins/target) for horizontal cluster scaling via [Gigahost](https://gigahost.no) cloud servers (hourly-billed KVM VPS or dedicated bare metal).
 
-Deploys new servers when cluster resources are exhausted and cancels idle servers on scale-in. Servers are identified by the Nomad node meta key `unique.platform.gigahost.server_id` (the Gigahost `srv_id`), which workers set during bootstrap — either in the client config:
-
-```hcl
-client {
-  meta {
-    "unique.platform.gigahost.server_id" = "17536"
-  }
-}
-```
-
-or at runtime with `nomad node meta apply 'unique.platform.gigahost.server_id=17536'`. (A node *attribute* of the same name is also honoured and takes precedence, but Nomad has no Gigahost fingerprinter, so meta is the practical path.)
+Servers are named `<gigahost_hostname_prefix>-<random>` at deploy. Gigahost sets the OS hostname from the name, Nomad fingerprints it, and scale-in uses it to match nodes back to servers. Don't rename autoscaler-managed servers or override their OS hostnames.
 
 ## Agent Configuration
 
@@ -41,10 +31,6 @@ node {
 ```
 
 ## Policy Configuration
-
-A cluster policy that adds workers when the pool runs low on schedulable
-capacity — i.e. Nomad can no longer place new allocations, not when CPU/RAM
-utilization is high:
 
 ```hcl
 scaling "gigahost_workers" {
@@ -78,33 +64,27 @@ scaling "gigahost_workers" {
       node_purge             = "true"
       node_selector_strategy = "least_busy"
 
-      gigahost_product_name = "KVM Value VPS 4GB"
-      gigahost_region       = "Sandefjord"
-      gigahost_os_distro    = "Ubuntu"
-      gigahost_os_version   = "24.04"
-      gigahost_ssh_keys     = "101,102"
+      gigahost_product_name    = "KVM Performance VPS 4GB"
+      gigahost_region          = "Sandefjord"
+      gigahost_os_distro       = "Ubuntu"
+      gigahost_os_version      = "24.04"
+      gigahost_hostname_prefix = "worker"
+      gigahost_ssh_keys        = "101,102"
     }
   }
 }
 ```
 
-Both checks track **allocated** (reserved) capacity, not utilization; with two
-the autoscaler scales out on whichever resource — CPU or memory — is tightest.
-
-Note for nomad-apm cluster queries: the autoscaler expands the short query
-using the target's **`node_class` only**, so workers must carry a node class
-and the policy must filter on it (a `datacenter`/`node_pool`-only filter
-leaves the query without a usable pool). The autoscaler also forces
-`min = 1` — a Gigahost pool cannot be scaled to zero through the Nomad APM.
+The checks track **allocated** capacity, so the pool grows when Nomad runs out of room to place allocations, on whichever resource is tightest.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `gigahost_product_name` | `""` | Catalog product name, e.g. `KVM Value VPS 4GB`. Required for scale-out |
+| `gigahost_product_name` | `""` | Catalog product name, e.g. `KVM Performance VPS 4GB`. Required for scale-out |
 | `gigahost_region` | `""` | Region name or short name, e.g. `Sandefjord`. Required for scale-out |
 | `gigahost_os_distro` | `""` | OS distribution to install, e.g. `Ubuntu`. Required for scale-out |
 | `gigahost_os_version` | `""` | OS version, e.g. `24.04`. Required for scale-out |
+| `gigahost_hostname_prefix` | `""` | Server names/hostnames are `<prefix>-<random>`; this is how nodes are identified. Required for scale-out |
 | `gigahost_ssh_keys` | `""` | Comma-separated SSH key ids to authorize on new servers |
-| `gigahost_hostname` | `""` | Hostname for new servers; applied only when a scale-out creates a single server. **Leave empty** so Gigahost assigns unique hostnames |
 | `gigahost_backups` | `false` | Enable daily backups (adds 25% to the price) |
 | `datacenter` | `""` | Nomad client datacenter filter |
 | `node_class` | `""` | Nomad client node class filter |
@@ -113,21 +93,17 @@ leaves the query without a usable pool). The autoscaler also forces
 | `node_purge` | `false` | Purge the Nomad node after cancellation |
 | `node_selector_strategy` | `least_busy` | Node selection strategy for scale-in |
 
-At least one of `datacenter`, `node_class`, or `node_pool` is required — it identifies the pool that this policy scales.
+Notes:
 
-### Product, region, and OS names
+- At least one of `datacenter`, `node_class`, or `node_pool` is required to identify the pool. nomad-apm cluster queries only work with `node_class`, and the autoscaler forces `min = 1` (a pool cannot scale to zero through the Nomad APM).
+- Product, region, and OS names are the same the [terraform-provider-gigahost](https://github.com/pigeon-as/terraform-provider-gigahost) `gigahost_server` resource uses.
 
-These are the same names the [terraform-provider-gigahost](https://github.com/pigeon-as/terraform-provider-gigahost) `gigahost_server` resource uses, resolved to catalog ids at scale-out.
+## Scaling Behaviour
 
-## Delivery Latency
-
-Gigahost servers take several minutes to deploy, install, and join the cluster. Gigahost isn't a scale set — there's no provider-side desired-capacity (resize) API like AWS ASG / Azure VMSS / GCE MIG have — so three mechanisms guard against double-deploying:
-
-- A scale-out is one batch deploy order; `Scale` blocks until every server reports ready (30-minute timeout) **and** the new nodes have joined the Nomad pool (`retry_attempts` × 10s), so the count reflects the new capacity before the next evaluation.
-- `Status` reports the target not-ready while a scaling action is executing and while any server on the account is still installing — the latter, unlike cooldown, survives autoscaler restarts. (The install check is account-wide: a manual deploy on the same account briefly pauses autoscaling.)
-- The policy **`cooldown`** (above) covers the rest.
-
-A server that deploys but never joins Nomad fails the scale-out with its `server_id` in the log, and is invisible to scale-in — alert on scale-out failures and cancel such servers manually.
+- Servers take several minutes to deploy; set a generous policy `cooldown`. The cooldown survives autoscaler restarts: the plugin reports the last server creation/deletion as the last scaling event.
+- A scale-out is one batch deploy; `Scale` returns once the servers are ready (30-minute timeout) and the new nodes have joined the Nomad pool (`retry_attempts` × 10s).
+- The target reports not-ready while a scaling action runs or any server on the account is installing — a manual deploy on the same account briefly pauses autoscaling.
+- A server that deploys but never joins Nomad fails the scale-out with its `server_id` in the log and is invisible to scale-in; alert on scale-out failures and cancel such servers manually.
 
 ## Build
 
