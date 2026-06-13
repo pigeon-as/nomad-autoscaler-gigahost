@@ -24,19 +24,12 @@ const (
 
 	hostnameSuffixLen = 6
 
-	serverDeployTimeout = 30 * time.Minute
 	maxDeployPollErrors = 4
-
-	// The deploy status view can omit in-flight orders; every 3rd consecutive
-	// miss the server list / by-id reads are consulted instead.
-	listEveryMisses = 3
-	// A 404 on the by-id read is definitive; a seen server absent this many
-	// consecutive checks is gone.
-	maxGoneChecks = 4
 )
 
-// Vars so tests can poll fast.
+// Vars so tests can poll fast and bound the deploy wait.
 var (
+	serverDeployTimeout      = 30 * time.Minute
 	serverDeployPollInterval = 5 * time.Second
 	defaultRetryInterval     = 10 * time.Second
 )
@@ -120,9 +113,11 @@ func (t *TargetPlugin) createServers(ctx context.Context, in gigahost.DeployInpu
 	return t.waitForServers(ctx, result.OrderIDs, want)
 }
 
-// waitForServers polls the deploy orders until want servers are ready.
-// Observed srv_ids are carried in every error so a late-materializing server
-// is never anonymous.
+// waitForServers polls the deploy status until want servers reach a terminal
+// status, mirroring terraform-provider-gigahost's waitForServer. Observed
+// srv_ids are kept so a deploy that never finishes names them in the error.
+// A deploy that never reaches a final status — including one the deploy status
+// API stops reporting — surfaces as a timeout.
 func (t *TargetPlugin) waitForServers(ctx context.Context, orderIDs []int64, want int64) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, serverDeployTimeout)
 	defer cancel()
@@ -138,19 +133,10 @@ func (t *TargetPlugin) waitForServers(ctx context.Context, orderIDs []int64, wan
 	ready := make(map[string]bool)
 	observed := make(map[string]bool)
 	pollErrors := 0
-	statusMisses := 0
-	goneChecks := 0
 
-	readyIDs := func() []string {
-		ids := make([]string, 0, len(ready))
-		for id := range ready {
-			ids = append(ids, id)
-		}
-		return ids
-	}
-	observedIDs := func() []string {
-		ids := make([]string, 0, len(observed))
-		for id := range observed {
+	idsOf := func(m map[string]bool) []string {
+		ids := make([]string, 0, len(m))
+		for id := range m {
 			ids = append(ids, id)
 		}
 		return ids
@@ -161,23 +147,23 @@ func (t *TargetPlugin) waitForServers(ctx context.Context, orderIDs []int64, wan
 		if err != nil {
 			pollErrors++
 			if pollErrors > maxDeployPollErrors {
-				return nil, fmt.Errorf("polling deploy status for orders %v failed %d times in a row (observed server ids %v): %v", orderIDs, pollErrors, observedIDs(), err)
+				return nil, fmt.Errorf("polling deploy status for orders %v failed %d times in a row (observed server ids %v): %v", orderIDs, pollErrors, idsOf(observed), err)
 			}
 		} else {
 			pollErrors = 0
-
-			seen := 0
 			for _, s := range status.Servers {
 				if !orderSet[s.Order()] {
 					continue
 				}
-				seen++
-				if id := s.Server(); id != 0 {
+				id := s.Server()
+				if id != 0 {
 					observed[strconv.FormatInt(id, 10)] = true
 				}
 				switch s.Status {
-				case "ready":
-					ready[strconv.FormatInt(s.Server(), 10)] = true
+				case "ready", "rescue", "iso":
+					if id != 0 {
+						ready[strconv.FormatInt(id, 10)] = true
+					}
 				case "error", "failed", "cancelled", "suspended":
 					return nil, fmt.Errorf("server (order %d) failed to deploy: status %q", s.Order(), s.Status)
 				default:
@@ -186,89 +172,17 @@ func (t *TargetPlugin) waitForServers(ctx context.Context, orderIDs []int64, wan
 				}
 			}
 
-			if seen > 0 {
-				statusMisses = 0
-				goneChecks = 0
-			} else {
-				statusMisses++
-				if statusMisses%listEveryMisses == 0 {
-					switch {
-					case len(observed) > 0:
-						if t.collectObserved(ctx, observed, ready) > 0 {
-							goneChecks = 0
-						} else {
-							goneChecks++
-							if goneChecks >= maxGoneChecks {
-								return nil, fmt.Errorf("servers %v (orders %v) disappeared while provisioning: the deploy status and server APIs no longer report them", observedIDs(), orderIDs)
-							}
-						}
-					case t.collectFromServerList(ctx, orderSet, ready, observed):
-					default:
-						t.logger.Debug("orders not reported by deploy status or server list yet",
-							"order_ids", orderIDs)
-					}
-				}
-			}
-
 			if int64(len(ready)) >= want {
-				return readyIDs(), nil
+				return idsOf(ready), nil
 			}
 		}
 
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("timed out waiting for %d servers (orders %v) to be ready; observed server ids %v — cancel manually if they materialize: %v", want, orderIDs, observedIDs(), ctx.Err())
+			return nil, fmt.Errorf("timed out waiting for %d servers (orders %v) to be ready; observed server ids %v — cancel manually if they materialize: %v", want, orderIDs, idsOf(observed), ctx.Err())
 		case <-ticker.C:
 		}
 	}
-}
-
-// collectObserved reads each observed server by id, marking finished installs
-// as ready and reporting how many are still live.
-func (t *TargetPlugin) collectObserved(ctx context.Context, observed, ready map[string]bool) int {
-	live := 0
-	for id := range observed {
-		s, err := t.client.GetServer(ctx, id)
-		switch {
-		case errors.Is(err, gigahost.ErrNotFound):
-		case err != nil:
-			live++ // a transient API error is not evidence the server is gone
-		case s.Cancelled():
-		default:
-			live++
-			if !s.Installing() && s.Running() {
-				ready[id] = true
-			} else {
-				t.logger.Debug("order missing from deploy status; server still provisioning",
-					"server_id", id)
-			}
-		}
-	}
-	return live
-}
-
-func (t *TargetPlugin) collectFromServerList(ctx context.Context, orderSet map[int64]bool, ready, observed map[string]bool) bool {
-	servers, err := t.client.ListServers(ctx)
-	if err != nil {
-		return false
-	}
-
-	matched := false
-	for _, s := range servers {
-		orderID, err := strconv.ParseInt(s.Order.OrderID, 10, 64)
-		if err != nil || !orderSet[orderID] || s.Cancelled() {
-			continue
-		}
-		matched = true
-		observed[s.SrvID] = true
-		if !s.Installing() && s.Running() {
-			ready[s.SrvID] = true
-		} else {
-			t.logger.Debug("order missing from deploy status; server still provisioning per server list",
-				"order_id", orderID, "server_id", s.SrvID)
-		}
-	}
-	return matched
 }
 
 func (t *TargetPlugin) deleteServer(ctx context.Context, serverID string) error {

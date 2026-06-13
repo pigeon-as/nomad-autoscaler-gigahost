@@ -158,7 +158,7 @@ func findPluginBinary() string {
 }
 
 func lifecycleEnvSet() bool {
-	for _, key := range []string{"E2E_PRODUCT_NAME", "E2E_REGION", "E2E_OS_DISTRO", "E2E_OS_VERSION"} {
+	for _, key := range []string{"E2E_PRODUCT_NAME", "E2E_REGION", "E2E_OS"} {
 		if os.Getenv(key) == "" {
 			return false
 		}
@@ -190,9 +190,8 @@ func writeScaleOutPolicy(dir string) error {
       datacenter            = "dc1"
       node_class            = "gigahost-e2e"
       gigahost_product_name = %q
-      gigahost_region       = %q
-      gigahost_os_distro    = %q
-      gigahost_os_version   = %q
+      gigahost_region_name  = %q
+      gigahost_os_name      = %q
       gigahost_ssh_keys     = %q
       gigahost_hostname_prefix = %q
     }
@@ -200,8 +199,7 @@ func writeScaleOutPolicy(dir string) error {
 }
 `, os.Getenv("E2E_PRODUCT_NAME"),
 		os.Getenv("E2E_REGION"),
-		os.Getenv("E2E_OS_DISTRO"),
-		os.Getenv("E2E_OS_VERSION"),
+		os.Getenv("E2E_OS"),
 		os.Getenv("E2E_SSH_KEYS"),
 		envOrDefault("E2E_HOSTNAME", "e2e-test"))
 
@@ -304,7 +302,7 @@ func resolveDeployInput(t *testing.T, c *gigahost.Client) gigahost.DeployInput {
 	must.True(t, productID != 0)
 
 	for _, r := range catalog.Regions {
-		if strings.EqualFold(r.RegionName, os.Getenv("E2E_REGION")) || strings.EqualFold(r.RegionNameShort, os.Getenv("E2E_REGION")) {
+		if strings.EqualFold(r.RegionName, os.Getenv("E2E_REGION")) {
 			id, err := strconv.ParseInt(r.RegionID, 10, 64)
 			must.NoError(t, err)
 			regionID = id
@@ -316,8 +314,7 @@ func resolveDeployInput(t *testing.T, c *gigahost.Client) gigahost.DeployInput {
 	must.NoError(t, err)
 	var osID int64
 	for _, e := range osCatalog {
-		if strings.EqualFold(e.Distro.DistName, os.Getenv("E2E_OS_DISTRO")) &&
-			strings.Contains(strings.ToLower(e.OS.OsName), strings.ToLower(os.Getenv("E2E_OS_VERSION"))) {
+		if strings.EqualFold(e.OS.OsName, os.Getenv("E2E_OS")) || strings.EqualFold(e.OS.OsDist, os.Getenv("E2E_OS")) {
 			id, err := strconv.ParseInt(e.OS.OsID, 10, 64)
 			must.NoError(t, err)
 			osID = id
@@ -472,7 +469,7 @@ func TestScaleInLifecycle(t *testing.T) {
 		t.Skip("skipping: -short")
 	}
 	if !lifecycleEnvSet() {
-		t.Skip("skipping: E2E_PRODUCT_NAME, E2E_REGION, E2E_OS_DISTRO, E2E_OS_VERSION required")
+		t.Skip("skipping: E2E_PRODUCT_NAME, E2E_REGION, E2E_OS required")
 	}
 
 	client := newGigahostClient(t)
@@ -627,7 +624,7 @@ func TestScaleLifecycle(t *testing.T) {
 		t.Skip("skipping: -short")
 	}
 	if !lifecycleEnvSet() {
-		t.Skip("skipping: E2E_PRODUCT_NAME, E2E_REGION, E2E_OS_DISTRO, E2E_OS_VERSION required")
+		t.Skip("skipping: E2E_PRODUCT_NAME, E2E_REGION, E2E_OS required")
 	}
 
 	client := newGigahostClient(t)

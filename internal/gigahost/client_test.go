@@ -115,6 +115,25 @@ func TestClientGetServer(t *testing.T) {
 		must.Error(t, err)
 		must.True(t, errors.Is(err, ErrNotFound))
 	})
+
+	// An empty or non-numeric id must be rejected before the request, or the
+	// path collapses to the list endpoint and answers with another server.
+	t.Run("invalid id rejected without a request", func(t *testing.T) {
+		called := false
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			called = true
+		}))
+		defer srv.Close()
+
+		c, err := NewClient(&Config{Address: srv.URL + "/api/v0", Token: "test-token"})
+		must.NoError(t, err)
+
+		for _, id := range []string{"", "  ", "abc"} {
+			_, err = c.GetServer(context.Background(), id)
+			must.Error(t, err)
+		}
+		must.False(t, called)
+	})
 }
 
 func TestClientCancelServerNotFound(t *testing.T) {

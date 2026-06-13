@@ -20,9 +20,8 @@ during the test window may be cancelled.
 | `GIGAHOST_API_TOKEN` | Yes | | Gigahost API token |
 | `GIGAHOST_BASE_URL` | No | `https://api.gigahost.no/api/v0` | Override the API address |
 | `E2E_PRODUCT_NAME` | Lifecycle only | | Catalog product name (e.g. `KVM Performance VPS 4GB`) |
-| `E2E_REGION` | Lifecycle only | | Region name or short name (e.g. `Sandefjord`) |
-| `E2E_OS_DISTRO` | Lifecycle only | | OS distribution (e.g. `Ubuntu`) |
-| `E2E_OS_VERSION` | Lifecycle only | | OS version (e.g. `24.04`) |
+| `E2E_REGION` | Lifecycle only | | Region name (e.g. `Sandefjord`) |
+| `E2E_OS` | Lifecycle only | | OS image name or codename (e.g. `Ubuntu 24.04 LTS` or `noble`) |
 | `E2E_SSH_KEYS` | No | | Comma-separated SSH key ids |
 | `E2E_HOSTNAME` | No | `e2e-test` | Hostname prefix for new servers |
 
@@ -38,8 +37,7 @@ make dev
 export GIGAHOST_API_TOKEN="flux_live_..."
 export E2E_PRODUCT_NAME="KVM Performance VPS 4GB"
 export E2E_REGION="Sandefjord"
-export E2E_OS_DISTRO="Ubuntu"
-export E2E_OS_VERSION="24.04"
+export E2E_OS="Ubuntu 24.04 LTS"
 make e2e
 ```
 
