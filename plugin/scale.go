@@ -76,15 +76,11 @@ func (t *TargetPlugin) scaleOut(ctx context.Context, desired, current int64, con
 	if err != nil {
 		return err
 	}
-	region, err := requireString(config, configKeyRegion)
+	regionName, err := requireString(config, configKeyRegionName)
 	if err != nil {
 		return err
 	}
-	osDistro, err := requireString(config, configKeyOSDistro)
-	if err != nil {
-		return err
-	}
-	osVersion, err := requireString(config, configKeyOSVersion)
+	osImage, err := osImageFor(config)
 	if err != nil {
 		return err
 	}
@@ -107,19 +103,19 @@ func (t *TargetPlugin) scaleOut(ctx context.Context, desired, current int64, con
 	if err != nil {
 		return err
 	}
-	regionID, err := resolveRegion(catalog, region)
+	regionID, err := resolveRegion(catalog, regionName)
 	if err != nil {
 		return err
 	}
 	if !productOffersRegion(catalog, productID, regionID) {
-		return fmt.Errorf("product %q is not available in region %q", productName, region)
+		return fmt.Errorf("product %q is not available in region %q", productName, regionName)
 	}
 
 	osCatalog, err := t.client.GetOSCatalog(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to read Gigahost OS catalog: %v", err)
 	}
-	osID, err := resolveOS(osCatalog, osDistro, osVersion)
+	osID, err := resolveOS(osCatalog, osImage)
 	if err != nil {
 		return err
 	}

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"path"
+	"strconv"
 	"strings"
 )
 
@@ -42,6 +43,11 @@ func (s Server) Cancelled() bool { return strings.EqualFold(s.Order.OrderStatus,
 // unlike the list, which can transiently omit live servers. The API wraps
 // the single server in an array.
 func (c *Client) GetServer(ctx context.Context, id string) (*Server, error) {
+	// An empty or non-numeric id would change the request path.
+	if _, err := strconv.ParseInt(id, 10, 64); err != nil {
+		return nil, fmt.Errorf("gigahost: invalid server id %q", id)
+	}
+
 	req, err := c.newRequest(ctx, http.MethodGet, path.Join("servers", id), nil, nil)
 	if err != nil {
 		return nil, err
@@ -51,8 +57,8 @@ func (c *Client) GetServer(ctx context.Context, id string) (*Server, error) {
 	if err := c.sendRequest(req, &servers); err != nil {
 		return nil, err
 	}
-	if len(servers) == 0 {
-		return nil, fmt.Errorf("gigahost: server %s: empty response", id)
+	if len(servers) != 1 {
+		return nil, fmt.Errorf("gigahost: server %s: expected one server in the response, got %d", id, len(servers))
 	}
 	return &servers[0], nil
 }

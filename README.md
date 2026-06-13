@@ -65,9 +65,8 @@ scaling "gigahost_workers" {
       node_selector_strategy = "least_busy"
 
       gigahost_product_name    = "KVM Performance VPS 4GB"
-      gigahost_region          = "Sandefjord"
-      gigahost_os_distro       = "Ubuntu"
-      gigahost_os_version      = "24.04"
+      gigahost_region_name     = "Sandefjord"
+      gigahost_os_name         = "Ubuntu 24.04 LTS"
       gigahost_hostname_prefix = "worker"
       gigahost_ssh_keys        = "101,102"
     }
@@ -79,10 +78,10 @@ The checks track **allocated** capacity, so the pool grows when Nomad runs out o
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `gigahost_product_name` | `""` | Catalog product name, e.g. `KVM Performance VPS 4GB`. Required for scale-out |
-| `gigahost_region` | `""` | Region name or short name, e.g. `Sandefjord`. Required for scale-out |
-| `gigahost_os_distro` | `""` | OS distribution to install, e.g. `Ubuntu`. Required for scale-out |
-| `gigahost_os_version` | `""` | OS version, e.g. `24.04`. Required for scale-out |
+| `gigahost_product_name` | `""` | Catalog product name, e.g. `KVM Performance VPS 4GB`, matched exactly. Required for scale-out |
+| `gigahost_region_name` | `""` | Region name, e.g. `Sandefjord`, matched exactly. Required for scale-out |
+| `gigahost_os_name` | `""` | OS image name, e.g. `Ubuntu 24.04 LTS`, matched exactly. Provide this or `gigahost_os_dist` |
+| `gigahost_os_dist` | `""` | OS codename, e.g. `noble`, matched exactly. Alternative to `gigahost_os_name` |
 | `gigahost_hostname_prefix` | `""` | Server names/hostnames are `<prefix>-<random>`; this is how nodes are identified. Required for scale-out |
 | `gigahost_ssh_keys` | `""` | Comma-separated SSH key ids to authorize on new servers |
 | `gigahost_backups` | `false` | Enable daily backups (adds 25% to the price) |
@@ -96,7 +95,7 @@ The checks track **allocated** capacity, so the pool grows when Nomad runs out o
 Notes:
 
 - At least one of `datacenter`, `node_class`, or `node_pool` is required to identify the pool. nomad-apm cluster queries only work with `node_class`, and the autoscaler forces `min = 1` (a pool cannot scale to zero through the Nomad APM).
-- Product, region, and OS names are the same the [terraform-provider-gigahost](https://github.com/pigeon-as/terraform-provider-gigahost) `gigahost_server` resource uses.
+- The product, region, and OS values are the Gigahost API's own names, matched exactly — the same the [terraform-provider-gigahost](https://github.com/pigeon-as/terraform-provider-gigahost) `gigahost_server` resource uses. `gigahost_os_name` (e.g. `Ubuntu 24.04 LTS`) and `gigahost_os_dist` (the codename, e.g. `noble`) are mutually exclusive.
 
 ## Scaling Behaviour
 

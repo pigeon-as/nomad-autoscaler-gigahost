@@ -169,71 +169,60 @@ func testCatalog() *gigahost.DeployCatalog {
 	}
 }
 
-// Status view omits the order; the server list (matched by order id)
-// completes the wait.
-func TestWaitForServersListFallback(t *testing.T) {
-	orig := serverDeployPollInterval
-	serverDeployPollInterval = 5 * time.Millisecond
-	t.Cleanup(func() { serverDeployPollInterval = orig })
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
-		case "/deploy/status":
-			_, _ = w.Write([]byte(`{"meta":{},"data":{"servers":[]}}`))
-		case "/servers":
-			_, _ = w.Write([]byte(`{"meta":{},"data":[
-				{"srv_id":"77","srv_status":"1","srv_status_install":"0","order":{"order_id":"500","order_status":"active"}}
-			]}`))
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer srv.Close()
-
-	client, err := gigahost.NewClient(&gigahost.Config{Address: srv.URL, Token: "t"})
-	must.NoError(t, err)
-
-	tp := &TargetPlugin{client: client, logger: testLogger(), retryAttempts: 1}
-	ids, err := tp.waitForServers(context.Background(), []int64{500}, 1)
-	must.NoError(t, err)
-	must.Eq(t, 1, len(ids))
-	must.Eq(t, "77", ids[0])
-}
-
-// A previously observed server that disappears from both views is gone.
-func TestWaitForServersGone(t *testing.T) {
-	orig := serverDeployPollInterval
+// The wait polls deploy status only: a terminal status ends it, a failure
+// status errors, and a server stuck installing times out naming its srv_id.
+func TestWaitForServers(t *testing.T) {
+	origPoll, origTimeout := serverDeployPollInterval, serverDeployTimeout
 	serverDeployPollInterval = time.Millisecond
-	t.Cleanup(func() { serverDeployPollInterval = orig })
+	t.Cleanup(func() { serverDeployPollInterval, serverDeployTimeout = origPoll, origTimeout })
 
-	first := true
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		switch r.URL.Path {
-		case "/deploy/status":
-			if first {
-				first = false
-				_, _ = w.Write([]byte(`{"meta":{},"data":{"servers":[{"order_id":"500","srv_id":"77","status":"installing"}]}}`))
-				return
-			}
-			_, _ = w.Write([]byte(`{"meta":{},"data":{"servers":[]}}`))
-		case "/servers":
-			_, _ = w.Write([]byte(`{"meta":{},"data":[]}`))
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer srv.Close()
+	newClient := func(t *testing.T, handler http.HandlerFunc) *gigahost.Client {
+		srv := httptest.NewServer(handler)
+		t.Cleanup(srv.Close)
+		c, err := gigahost.NewClient(&gigahost.Config{Address: srv.URL, Token: "t"})
+		must.NoError(t, err)
+		return c
+	}
 
-	client, err := gigahost.NewClient(&gigahost.Config{Address: srv.URL, Token: "t"})
-	must.NoError(t, err)
+	t.Run("ready across two orders", func(t *testing.T) {
+		serverDeployTimeout = origTimeout
+		c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"meta":{},"data":{"servers":[
+				{"order_id":"500","srv_id":"77","status":"ready"},
+				{"order_id":"501","srv_id":"78","status":"ready"}
+			]}}`))
+		})
+		tp := &TargetPlugin{client: c, logger: testLogger()}
+		ids, err := tp.waitForServers(context.Background(), []int64{500, 501}, 2)
+		must.NoError(t, err)
+		must.SliceContainsAll(t, []string{"77", "78"}, ids)
+	})
 
-	tp := &TargetPlugin{client: client, logger: testLogger(), retryAttempts: 1}
-	_, err = tp.waitForServers(context.Background(), []int64{500}, 1)
-	must.Error(t, err)
-	must.StrContains(t, err.Error(), "disappeared")
-	must.StrContains(t, err.Error(), "77")
+	t.Run("failure status errors", func(t *testing.T) {
+		serverDeployTimeout = origTimeout
+		c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"meta":{},"data":{"servers":[{"order_id":"500","srv_id":"77","status":"failed"}]}}`))
+		})
+		tp := &TargetPlugin{client: c, logger: testLogger()}
+		_, err := tp.waitForServers(context.Background(), []int64{500}, 1)
+		must.Error(t, err)
+		must.StrContains(t, err.Error(), "failed")
+	})
+
+	t.Run("stuck installing times out naming the server", func(t *testing.T) {
+		serverDeployTimeout = 20 * time.Millisecond
+		c := newClient(t, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"meta":{},"data":{"servers":[{"order_id":"500","srv_id":"77","status":"installing"}]}}`))
+		})
+		tp := &TargetPlugin{client: c, logger: testLogger()}
+		_, err := tp.waitForServers(context.Background(), []int64{500}, 1)
+		must.Error(t, err)
+		must.StrContains(t, err.Error(), "timed out")
+		must.StrContains(t, err.Error(), "77")
+	})
 }
 
 func TestEnsureServersGone(t *testing.T) {
@@ -361,10 +350,9 @@ func TestResolveRegion(t *testing.T) {
 		must.NoError(t, err)
 		must.Eq(t, int64(3), id)
 	})
-	t.Run("match by short name", func(t *testing.T) {
-		id, err := resolveRegion(cat, "sdj")
-		must.NoError(t, err)
-		must.Eq(t, int64(3), id)
+	t.Run("short name no longer matches", func(t *testing.T) {
+		_, err := resolveRegion(cat, "sdj")
+		must.Error(t, err)
 	})
 	t.Run("inactive region", func(t *testing.T) {
 		_, err := resolveRegion(cat, "Oslo")
@@ -379,22 +367,27 @@ func TestResolveRegion(t *testing.T) {
 func TestResolveOS(t *testing.T) {
 	t.Parallel()
 	cat := []gigahost.OSCatalogEntry{
-		{Distro: gigahost.Distro{DistName: "Ubuntu", DistValue: "ubuntu"}, OS: gigahost.OSImage{OsID: "42", OsName: "Ubuntu 24.04", OsDist: "24.04"}},
-		{Distro: gigahost.Distro{DistName: "Ubuntu", DistValue: "ubuntu"}, OS: gigahost.OSImage{OsID: "43", OsName: "Ubuntu 22.04", OsDist: "22.04"}},
-		{Distro: gigahost.Distro{DistName: "Debian", DistValue: "debian"}, OS: gigahost.OSImage{OsID: "50", OsName: "Debian 12", OsDist: "12"}},
+		{Distro: gigahost.Distro{DistName: "Ubuntu", DistValue: "ubuntu"}, OS: gigahost.OSImage{OsID: "102", OsName: "Ubuntu 24.04 LTS", OsDist: "noble"}},
+		{Distro: gigahost.Distro{DistName: "Ubuntu", DistValue: "ubuntu"}, OS: gigahost.OSImage{OsID: "93", OsName: "Ubuntu 22.04 LTS", OsDist: "jammy"}},
+		{Distro: gigahost.Distro{DistName: "Debian", DistValue: "debian"}, OS: gigahost.OSImage{OsID: "50", OsName: "Debian 12", OsDist: "bookworm"}},
 	}
 
-	t.Run("distro and version", func(t *testing.T) {
-		id, err := resolveOS(cat, "Ubuntu", "24.04")
+	t.Run("match by os_name", func(t *testing.T) {
+		id, err := resolveOS(cat, "Ubuntu 24.04 LTS")
 		must.NoError(t, err)
-		must.Eq(t, int64(42), id)
+		must.Eq(t, int64(102), id)
 	})
-	t.Run("not found", func(t *testing.T) {
-		_, err := resolveOS(cat, "Ubuntu", "18.04")
+	t.Run("match by codename", func(t *testing.T) {
+		id, err := resolveOS(cat, "noble")
+		must.NoError(t, err)
+		must.Eq(t, int64(102), id)
+	})
+	t.Run("exact match only, not substring", func(t *testing.T) {
+		_, err := resolveOS(cat, "24.04")
 		must.Error(t, err)
 	})
-	t.Run("ambiguous version", func(t *testing.T) {
-		_, err := resolveOS(cat, "Ubuntu", "")
+	t.Run("not found", func(t *testing.T) {
+		_, err := resolveOS(cat, "Ubuntu 18.04 LTS")
 		must.Error(t, err)
 	})
 }
